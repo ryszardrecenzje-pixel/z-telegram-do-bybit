@@ -1,5 +1,6 @@
 """
 Basic risk checks before executing a trade.
+Position size = POSITION_SIZE_PCT % of available capital (default 10%).
 """
 
 from __future__ import annotations
@@ -24,15 +25,12 @@ class RiskDecision:
 class RiskManager:
     def __init__(
         self,
-        max_risk_per_trade_pct: float | None = None,
+        position_size_pct: float | None = None,
         max_daily_loss_pct: float | None = None,
-        default_position_size_usd: float | None = None,
+        **kwargs,  # accept legacy args from UI without breaking
     ):
-        self.max_risk_per_trade_pct = max_risk_per_trade_pct or config.MAX_RISK_PER_TRADE_PCT
+        self.position_size_pct = position_size_pct or config.POSITION_SIZE_PCT
         self.max_daily_loss_pct = max_daily_loss_pct or config.MAX_DAILY_LOSS_PCT
-        self.default_position_size_usd = (
-            default_position_size_usd or config.DEFAULT_POSITION_SIZE_USD
-        )
         self._daily_pnl: float = 0.0
         self._starting_equity: Optional[float] = None
 
@@ -70,25 +68,24 @@ class RiskManager:
                     f"Daily loss limit reached ({daily_loss_pct:.2f}% >= {self.max_daily_loss_pct}%)",
                 )
 
-        # Position size: fixed USD notional (simple & safe for demo)
-        notional = min(self.default_position_size_usd, cash * 0.95)
+        # Position size = X% of available capital
+        notional = cash * (self.position_size_pct / 100.0)
+        # leave a small buffer so we never try to use 100% of cash
+        notional = min(notional, cash * 0.98)
+
         if notional <= 0 or price <= 0:
             return RiskDecision(False, "Invalid notional or price")
 
         quantity = notional / price
 
-        # Optional: risk-based size using SL distance
-        if sl is not None and sl > 0 and side == "LONG" and price > sl:
-            risk_per_unit = price - sl
-            max_risk_amount = equity * (self.max_risk_per_trade_pct / 100)
-            qty_by_risk = max_risk_amount / risk_per_unit
-            quantity = min(quantity, qty_by_risk)
-
         if quantity * price > cash:
             return RiskDecision(False, f"Not enough cash for size {quantity:.4f}")
 
+        logger.info(
+            f"Size: {self.position_size_pct}% of capital → "
+            f"{notional:.2f} notional → qty={quantity:.6f} {symbol}"
+        )
         return RiskDecision(True, "OK", quantity=round(quantity, 6))
 
     async def check_close(self, broker: BaseBroker, symbol: str) -> RiskDecision:
-        # Closing is almost always allowed
         return RiskDecision(True, "OK")
