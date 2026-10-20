@@ -196,11 +196,40 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Telegram")
+    # Reload secrets on every UI render (Streamlit may load them after import)
+    config.reload()
     st.write(f"Signal bot: **@{config.SIGNAL_BOT_USERNAME}**")
-    if config.TELEGRAM_API_ID:
-        st.success("API ID ustawione")
+    status = config.status_summary()
+    if status["telegram_api_id_set"] and status["telegram_api_hash_set"]:
+        st.success("Telegram: API ID + Hash ustawione")
+    elif status["telegram_api_id_set"]:
+        st.warning("Jest API ID, ale brak API HASH")
     else:
         st.error("Brak TELEGRAM_API_ID – uzupełnij secrets / .env")
+        with st.expander("Jak ustawić secrets?"):
+            st.code(
+                """[telegram]
+api_id = 31647829
+api_hash = "twój_hash"
+phone = "+48514934698"
+signal_bot_username = "TraderRicziV2"
+
+[binance]
+api_key = "..."
+api_secret = "..."
+testnet = true
+
+[risk]
+position_size_pct = 10.0
+sl_pct = 1.0
+tp_pct = 3.0
+invert_signal = true""",
+                language="toml",
+            )
+            st.caption(
+                "Lokalnie: plik `.streamlit/secrets.toml`  ·  "
+                "Streamlit Cloud: Settings → Secrets"
+            )
 
     st.divider()
     col1, col2 = st.columns(2)
