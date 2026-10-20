@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
+from collections import deque
 from datetime import datetime
 from typing import Optional
 
@@ -30,36 +32,36 @@ st.set_page_config(
 )
 
 # ---------------------------------------------------------------------------
-# Session state helpers
+# Thread-safe shared state (background threads must NOT touch st.session_state)
 # ---------------------------------------------------------------------------
 
-def init_state():
-    defaults = {
-        "bot_running": False,
-        "listener": None,
-        "broker": None,
-        "executor": None,
-        "loop": None,
-        "thread": None,
-        "recent_signals": [],
-        "logs": [],
-        "error": None,
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
+_lock = threading.Lock()
+_shared_logs: deque = deque(maxlen=200)
+_shared_signals: deque = deque(maxlen=50)
+_shared_status = {
+    "bot_running": False,
+    "error": None,
+    "broker_name": None,
+}
+_runtime: dict = {
+    "broker": None,
+    "executor": None,
+    "listener": None,
+    "loop": None,
+}
 
 
-init_state()
-
-
-def add_log(msg: str):
+def add_log(msg: str) -> None:
+    """Safe from any thread."""
     ts = datetime.now().strftime("%H:%M:%S")
-    st.session_state.logs.insert(0, f"[{ts}] {msg}")
-    st.session_state.logs = st.session_state.logs[:200]
+    line = f"[{ts}] {msg}"
+    with _lock:
+        _shared_logs.appendleft(line)
+    logger.info(msg)
 
 
-def on_signal_callback(signal, result):
+def on_signal_callback(signal, result) -> None:
+    """Called from Telethon thread – must be thread-safe."""
     our_side = result.get("side") or signal.side
     entry = {
         "time": datetime.now().isoformat(timespec="seconds"),
@@ -75,12 +77,28 @@ def on_signal_callback(signal, result):
         "message": result.get("message"),
         "order_id": result.get("order_id"),
     }
-    st.session_state.recent_signals.insert(0, entry)
-    st.session_state.recent_signals = st.session_state.recent_signals[:50]
+    with _lock:
+        _shared_signals.appendleft(entry)
     add_log(
         f"{signal.action} {signal.symbol} signal={signal.side} → we={our_side} | "
         f"{'OK' if result.get('success') else 'FAIL'}: {result.get('message')}"
     )
+
+
+def init_state():
+    defaults = {
+        "listener": None,
+        "broker": None,
+        "executor": None,
+        "loop": None,
+        "thread": None,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+
+init_state()
 
 
 # ---------------------------------------------------------------------------
@@ -88,13 +106,13 @@ def on_signal_callback(signal, result):
 # ---------------------------------------------------------------------------
 
 def start_bot_background(broker_type: str, position_size_pct: float):
-    if st.session_state.bot_running:
+    if _shared_status["bot_running"]:
         return
 
     def run():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
-        st.session_state.loop = loop
+        st_session_loop_ref = loop  # store on shared later via session if needed
 
         async def main():
             try:
@@ -106,12 +124,22 @@ def start_bot_background(broker_type: str, position_size_pct: float):
                 await broker.connect()
                 risk = RiskManager(position_size_pct=position_size_pct)
                 executor = Executor(broker, risk)
-                listener = TelegramListener(executor, on_signal_callback=on_signal_callback)
+                listener = TelegramListener(
+                    executor, on_signal_callback=on_signal_callback
+                )
 
-                st.session_state.broker = broker
-                st.session_state.executor = executor
-                st.session_state.listener = listener
-                st.session_state.bot_running = True
+                # Module-level refs (thread-safe); session_state is main-thread only
+                global _runtime
+                _runtime["broker"] = broker
+                _runtime["executor"] = executor
+                _runtime["listener"] = listener
+                _runtime["loop"] = loop
+
+                with _lock:
+                    _shared_status["bot_running"] = True
+                    _shared_status["error"] = None
+                    _shared_status["broker_name"] = broker.name
+
                 add_log(
                     f"Bot started ({broker.name}) | "
                     f"size={position_size_pct}% capital | "
@@ -122,42 +150,63 @@ def start_bot_background(broker_type: str, position_size_pct: float):
                 await listener.start()
             except Exception as e:
                 logger.exception("Bot start failed")
-                st.session_state.error = str(e)
-                st.session_state.bot_running = False
+                with _lock:
+                    _shared_status["bot_running"] = False
+                    _shared_status["error"] = str(e)
                 add_log(f"ERROR: {e}")
 
-        loop.run_until_complete(main())
-        # Keep alive
         try:
+            loop.run_until_complete(main())
             loop.run_forever()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.exception("Event loop error")
+            with _lock:
+                _shared_status["bot_running"] = False
+                _shared_status["error"] = str(e)
+            add_log(f"LOOP ERROR: {e}")
 
-    t = threading.Thread(target=run, daemon=True)
+    t = threading.Thread(target=run, daemon=True, name="bot-runner")
     st.session_state.thread = t
     t.start()
+    # Give the thread a moment to set status
+    time.sleep(0.5)
 
 
 def stop_bot():
-    listener: Optional[TelegramListener] = st.session_state.listener
-    broker = st.session_state.broker
-    loop = st.session_state.loop
+    listener: Optional[TelegramListener] = _runtime.get("listener")
+    broker = _runtime.get("broker")
+    loop = _runtime.get("loop")
 
-    if listener and loop:
+    if listener and loop and loop.is_running():
         async def _stop():
-            await listener.stop()
+            try:
+                await listener.stop()
+            except Exception as e:
+                add_log(f"Listener stop: {e}")
             if broker:
-                await broker.disconnect()
+                try:
+                    await broker.disconnect()
+                except Exception as e:
+                    add_log(f"Broker disconnect: {e}")
 
         try:
             fut = asyncio.run_coroutine_threadsafe(_stop(), loop)
-            fut.result(timeout=10)
+            fut.result(timeout=15)
         except Exception as e:
             add_log(f"Stop error: {e}")
 
-    st.session_state.bot_running = False
-    st.session_state.listener = None
-    st.session_state.broker = None
+        try:
+            loop.call_soon_threadsafe(loop.stop)
+        except Exception:
+            pass
+
+    with _lock:
+        _shared_status["bot_running"] = False
+
+    _runtime["listener"] = None
+    _runtime["broker"] = None
+    _runtime["executor"] = None
+    _runtime["loop"] = None
     add_log("Bot stopped")
 
 
@@ -166,9 +215,10 @@ def stop_bot():
 # ---------------------------------------------------------------------------
 
 st.title("📈 Telegram Signal Trader")
-st.caption("Nasłuchuje sygnałów z Twojego bota (Telethon) i wykonuje je na koncie demo / paper.")
+st.caption(
+    "Nasłuchuje sygnałów z Twojego bota (Telethon) i wykonuje je na koncie demo / paper."
+)
 
-# Sidebar – settings
 with st.sidebar:
     st.header("Ustawienia")
 
@@ -196,7 +246,6 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Telegram")
-    # Reload secrets on every UI render (Streamlit may load them after import)
     config.reload()
     st.write(f"Signal bot: **@{config.SIGNAL_BOT_USERNAME}**")
     status = config.status_summary()
@@ -226,75 +275,77 @@ tp_pct = 3.0
 invert_signal = true""",
                 language="toml",
             )
-            st.caption(
-                "Lokalnie: plik `.streamlit/secrets.toml`  ·  "
-                "Streamlit Cloud: Settings → Secrets"
-            )
 
     st.divider()
+    bot_running = _shared_status["bot_running"]
     col1, col2 = st.columns(2)
     with col1:
-        if st.button("▶ Start bota", type="primary", disabled=st.session_state.bot_running):
+        if st.button("▶ Start bota", type="primary", disabled=bot_running):
             start_bot_background(broker_type, position_size_pct)
             st.rerun()
     with col2:
-        if st.button("⏹ Stop bota", disabled=not st.session_state.bot_running):
+        if st.button("⏹ Stop bota", disabled=not bot_running):
             stop_bot()
             st.rerun()
 
-    status = "🟢 Działa" if st.session_state.bot_running else "🔴 Zatrzymany"
-    st.markdown(f"**Status:** {status}")
+    status_label = "🟢 Działa" if bot_running else "🔴 Zatrzymany"
+    st.markdown(f"**Status:** {status_label}")
 
-    if st.session_state.error:
-        st.error(st.session_state.error)
+    if _shared_status.get("error"):
+        st.error(_shared_status["error"])
+
+    if st.button("🔄 Odśwież"):
+        st.rerun()
 
 
-# Main area
 tab1, tab2, tab3, tab4 = st.tabs(["Sygnały", "Pozycje", "Historia", "Logi"])
 
 with tab1:
     st.subheader("Ostatnie sygnały")
-    if st.session_state.recent_signals:
-        df = pd.DataFrame(st.session_state.recent_signals)
-        st.dataframe(df, use_container_width=True)
+    with _lock:
+        signals = list(_shared_signals)
+    if signals:
+        st.dataframe(pd.DataFrame(signals), use_container_width=True)
     else:
-        st.info("Brak przetworzonych sygnałów. Uruchom bota i poczekaj na wiadomość od sygnałowego bota.")
+        st.info(
+            "Brak przetworzonych sygnałów. Uruchom bota i poczekaj na wiadomość od sygnałowego bota."
+        )
 
 with tab2:
     st.subheader("Otwarte pozycje (Paper)")
-    if st.session_state.broker and st.session_state.bot_running:
+    broker = _runtime.get("broker")
+    loop = _runtime.get("loop")
+    if broker and _shared_status["bot_running"] and loop:
         try:
-            loop = st.session_state.loop
-            if loop:
-                positions = asyncio.run_coroutine_threadsafe(
-                    st.session_state.broker.get_open_positions(), loop
-                ).result(timeout=5)
-                bal = asyncio.run_coroutine_threadsafe(
-                    st.session_state.broker.get_balance(), loop
-                ).result(timeout=5)
+            positions = asyncio.run_coroutine_threadsafe(
+                broker.get_open_positions(), loop
+            ).result(timeout=5)
+            bal = asyncio.run_coroutine_threadsafe(
+                broker.get_balance(), loop
+            ).result(timeout=5)
 
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Cash", f"{bal.get('cash', 0):.2f} {bal.get('currency', '')}")
-                c2.metric("Equity", f"{bal.get('equity', 0):.2f}")
-                c3.metric("Otwarte pozycje", bal.get("open_positions", 0))
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Cash", f"{bal.get('cash', 0):.2f} {bal.get('currency', '')}")
+            c2.metric("Equity", f"{bal.get('equity', 0):.2f}")
+            c3.metric("Otwarte pozycje", bal.get("open_positions", 0))
 
-                if positions:
-                    rows = [
-                        {
-                            "Symbol": p.symbol,
-                            "Side": p.side,
-                            "Qty": p.quantity,
-                            "Entry": p.entry_price,
-                            "SL": p.sl,
-                            "TP": p.tp,
-                            "Score": p.signal_score,
-                            "Opened": p.opened_at.isoformat(timespec="seconds"),
-                        }
-                        for p in positions
-                    ]
-                    st.dataframe(pd.DataFrame(rows), use_container_width=True)
-                else:
-                    st.write("Brak otwartych pozycji.")
+            if positions:
+                rows = [
+                    {
+                        "Symbol": p.symbol,
+                        "Side": p.side,
+                        "Qty": p.quantity,
+                        "Entry": p.entry_price,
+                        "SL": p.sl,
+                        "TP": p.tp,
+                        "Score": p.signal_score,
+                        "Opened": p.opened_at.isoformat(timespec="seconds"),
+                    }
+                    for p in positions
+                ]
+                st.dataframe(pd.DataFrame(rows), use_container_width=True)
+            else:
+                st.write("Brak otwartych pozycji.")
         except Exception as e:
             st.warning(f"Nie można pobrać pozycji: {e}")
     else:
@@ -302,11 +353,12 @@ with tab2:
 
 with tab3:
     st.subheader("Historia transakcji (Paper)")
-    if st.session_state.broker and st.session_state.bot_running:
+    broker = _runtime.get("broker")
+    loop = _runtime.get("loop")
+    if broker and _shared_status["bot_running"] and loop:
         try:
-            loop = st.session_state.loop
             trades = asyncio.run_coroutine_threadsafe(
-                st.session_state.broker.get_trade_history(100), loop
+                broker.get_trade_history(100), loop
             ).result(timeout=5)
             if trades:
                 st.dataframe(pd.DataFrame(trades), use_container_width=True)
@@ -319,8 +371,10 @@ with tab3:
 
 with tab4:
     st.subheader("Logi")
-    if st.session_state.logs:
-        st.code("\n".join(st.session_state.logs), language="text")
+    with _lock:
+        logs = list(_shared_logs)
+    if logs:
+        st.code("\n".join(logs), language="text")
     else:
         st.write("Brak logów.")
 
@@ -331,6 +385,6 @@ st.markdown(
 - Klucze API i dane Telethon trzymaj wyłącznie w `.streamlit/secrets.toml` lub zmiennych środowiskowych.
 - Na początku zawsze używaj trybu **Paper (Demo)**.
 - Symbole typu WMT / BA / NOW to akcje – klasyczny Binance Spot ich nie obsłuży. Paper broker jest do tego stworzony.
-- Po pierwszym uruchomieniu Telethon poprosi o kod z SMS / aplikacji Telegram (tylko lokalnie).
+- **Streamlit Cloud:** pierwsze logowanie Telethon (kod SMS) działa tylko lokalnie. Na Cloud wrzuć gotowy plik sesji `data/telethon.session`.
 """
 )
