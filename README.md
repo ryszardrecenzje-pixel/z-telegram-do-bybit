@@ -37,14 +37,38 @@ cp .streamlit/secrets.toml.example .streamlit/secrets.toml
 # edytuj secrets.toml
 ```
 
-Potrzebne wartości:
+Przykład `secrets.toml` (zagnieżdżony – zalecany):
+
+```toml
+[telegram]
+api_id = 31647829
+api_hash = "twój_hash_z_my.telegram.org"
+phone = "+48514934698"
+signal_bot_username = "TraderRicziV2"
+
+[binance]
+api_key = "..."
+api_secret = "..."
+testnet = true
+
+[risk]
+position_size_pct = 10.0
+sl_pct = 1.0
+tp_pct = 3.0
+invert_signal = true
+```
 
 | Klucz | Skąd wziąć |
 |-------|------------|
-| `TELEGRAM_API_ID` / `api_id` | https://my.telegram.org/apps |
-| `TELEGRAM_API_HASH` / `api_hash` | tamże |
-| `TELEGRAM_PHONE` | numer w formacie `+48...` |
-| `SIGNAL_BOT_USERNAME` | `TraderRicziV2` (bez @) |
+| `api_id` / `api_hash` | https://my.telegram.org/apps |
+| `phone` | numer w formacie `+48...` |
+| `signal_bot_username` | `TraderRicziV2` (bez @) |
+
+### Strategia (domyślna)
+
+- Wielkość pozycji = **10%** dostępnego kapitału
+- Sygnał jest **odwracany**: signal LONG → otwieramy **SHORT** (i odwrotnie)
+- Stały **SL = 1%**, **TP = 3%** od ceny wejścia (SL/TP z sygnału są ignorowane)
 
 ### 3. Pierwsze logowanie Telethon
 

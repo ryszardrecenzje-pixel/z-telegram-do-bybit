@@ -60,12 +60,16 @@ def add_log(msg: str):
 
 
 def on_signal_callback(signal, result):
+    our_side = result.get("side") or signal.side
     entry = {
         "time": datetime.now().isoformat(timespec="seconds"),
         "action": signal.action,
         "symbol": signal.symbol,
-        "side": signal.side,
+        "signal_side": signal.side,
+        "our_side": our_side,
         "price": signal.price,
+        "sl": result.get("sl"),
+        "tp": result.get("tp"),
         "score": signal.score,
         "success": result.get("success"),
         "message": result.get("message"),
@@ -74,7 +78,7 @@ def on_signal_callback(signal, result):
     st.session_state.recent_signals.insert(0, entry)
     st.session_state.recent_signals = st.session_state.recent_signals[:50]
     add_log(
-        f"{signal.action} {signal.symbol} → "
+        f"{signal.action} {signal.symbol} signal={signal.side} → we={our_side} | "
         f"{'OK' if result.get('success') else 'FAIL'}: {result.get('message')}"
     )
 
@@ -83,7 +87,7 @@ def on_signal_callback(signal, result):
 # Async runner in background thread
 # ---------------------------------------------------------------------------
 
-def start_bot_background(broker_type: str, position_size: float, max_risk: float):
+def start_bot_background(broker_type: str, position_size_pct: float):
     if st.session_state.bot_running:
         return
 
@@ -100,10 +104,7 @@ def start_bot_background(broker_type: str, position_size: float, max_risk: float
                     broker = BinanceBroker()
 
                 await broker.connect()
-                risk = RiskManager(
-                    max_risk_per_trade_pct=max_risk,
-                    default_position_size_usd=position_size,
-                )
+                risk = RiskManager(position_size_pct=position_size_pct)
                 executor = Executor(broker, risk)
                 listener = TelegramListener(executor, on_signal_callback=on_signal_callback)
 
@@ -111,7 +112,12 @@ def start_bot_background(broker_type: str, position_size: float, max_risk: float
                 st.session_state.executor = executor
                 st.session_state.listener = listener
                 st.session_state.bot_running = True
-                add_log(f"Bot started with {broker.name} broker")
+                add_log(
+                    f"Bot started ({broker.name}) | "
+                    f"size={position_size_pct}% capital | "
+                    f"invert={config.INVERT_SIGNAL} | "
+                    f"SL={config.SL_PCT}% TP={config.TP_PCT}%"
+                )
 
                 await listener.start()
             except Exception as e:
@@ -173,19 +179,19 @@ with st.sidebar:
         help="Na start zawsze używaj Paper. Binance tylko gdy masz klucze i chcesz krypto.",
     )
 
-    position_size = st.number_input(
-        "Wielkość pozycji (USD)",
-        min_value=10.0,
-        max_value=10_000.0,
-        value=float(config.DEFAULT_POSITION_SIZE_USD),
-        step=10.0,
+    position_size_pct = st.number_input(
+        "Wielkość pozycji (% kapitału)",
+        min_value=1.0,
+        max_value=50.0,
+        value=float(config.POSITION_SIZE_PCT),
+        step=1.0,
+        help="Ile procent dostępnego kapitału przeznaczać na jedną transakcję.",
     )
-    max_risk = st.number_input(
-        "Max ryzyko na trade (%)",
-        min_value=0.1,
-        max_value=10.0,
-        value=float(config.MAX_RISK_PER_TRADE_PCT),
-        step=0.1,
+
+    st.info(
+        f"**Strategia:** sygnał odwracany  "
+        f"(LONG→SHORT / SHORT→LONG)  |  "
+        f"SL **{config.SL_PCT}%**  ·  TP **{config.TP_PCT}%**"
     )
 
     st.divider()
@@ -200,7 +206,7 @@ with st.sidebar:
     col1, col2 = st.columns(2)
     with col1:
         if st.button("▶ Start bota", type="primary", disabled=st.session_state.bot_running):
-            start_bot_background(broker_type, position_size, max_risk)
+            start_bot_background(broker_type, position_size_pct)
             st.rerun()
     with col2:
         if st.button("⏹ Stop bota", disabled=not st.session_state.bot_running):
