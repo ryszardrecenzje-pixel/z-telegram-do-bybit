@@ -227,6 +227,17 @@ st.caption(
     "Nasłuchuje sygnałów z Twojego bota (Telethon) i wykonuje je na koncie demo / paper."
 )
 
+# Auto-refresh while waiting for Telegram code / 2FA (background thread cannot trigger UI)
+_auth_st = _auth_state.get("status", "idle")
+if _auth_st in ("sending_code", "awaiting_code", "awaiting_password") or (
+    _shared_status.get("bot_running") and _auth_st not in ("running", "authorized", "error", "stopped", "idle")
+):
+    try:
+        from streamlit_autorefresh import st_autorefresh
+        st_autorefresh(interval=2000, key="auth_refresh")
+    except ImportError:
+        st.info("⏳ Czekam na logowanie Telegram… klikaj **🔄 Odśwież** co 2–3 s.")
+
 with st.sidebar:
     st.header("Ustawienia")
 
@@ -304,12 +315,18 @@ invert_signal = true""",
 
     # --- Interactive Telegram login (code / 2FA) ---
     auth_status = _auth_state.get("status", "idle")
-    if auth_status == "awaiting_code":
-        st.warning("📱 Telegram wysłał kod – wpisz go poniżej")
+    st.caption(f"Auth status: `{auth_status}`")
+    if auth_status == "sending_code":
+        st.info("📤 Wysyłam prośbę o kod do Telegrama… odśwież za chwilę.")
+    elif auth_status == "awaiting_code":
+        st.warning(
+            "📱 **Kod jest w aplikacji Telegram** (czat „Telegram” / oficjalne powiadomienie), "
+            "rzadko jako SMS. Wpisz go poniżej."
+        )
         code = st.text_input("Kod z Telegrama", key="tg_code_input")
-        if st.button("Wyślij kod") and code:
+        if st.button("Wyślij kod", type="primary") and code:
             _auth_state["code"] = code.strip()
-            st.info("Kod przekazany – czekam na logowanie...")
+            st.success("Kod przekazany – logowanie…")
             st.rerun()
     elif auth_status == "awaiting_password":
         st.warning("🔒 Wymagane hasło 2FA")
