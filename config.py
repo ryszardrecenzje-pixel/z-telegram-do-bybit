@@ -120,6 +120,11 @@ class _Config:
         return str(self._get("TELEGRAM_PHONE", "telegram", "phone", "") or "")
 
     @property
+    def TELEGRAM_SESSION_STRING(self) -> str:
+        """Telethon StringSession – required on Streamlit Cloud."""
+        return str(self._get("TELEGRAM_SESSION_STRING", "telegram", "session_string", "") or "")
+
+    @property
     def SIGNAL_BOT_USERNAME(self) -> str:
         return str(
             self._get("SIGNAL_BOT_USERNAME", "telegram", "signal_bot_username", "TraderRicziV2")
@@ -174,6 +179,7 @@ class _Config:
             "telegram_api_id_set": bool(self.TELEGRAM_API_ID),
             "telegram_api_hash_set": bool(self.TELEGRAM_API_HASH),
             "telegram_phone_set": bool(self.TELEGRAM_PHONE),
+            "telegram_session_string_set": bool(self.TELEGRAM_SESSION_STRING),
             "signal_bot": self.SIGNAL_BOT_USERNAME,
             "binance_key_set": bool(self.BINANCE_API_KEY),
             "binance_secret_set": bool(self.BINANCE_API_SECRET),

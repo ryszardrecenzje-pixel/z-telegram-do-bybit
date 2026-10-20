@@ -49,6 +49,12 @@ _runtime: dict = {
     "listener": None,
     "loop": None,
 }
+# Shared with Telethon for interactive login via Streamlit UI
+_auth_state: dict = {
+    "status": "idle",  # idle | awaiting_code | awaiting_password | authorized | running | error
+    "error": None,
+    "session_string": None,
+}
 
 
 def add_log(msg: str) -> None:
@@ -125,7 +131,9 @@ def start_bot_background(broker_type: str, position_size_pct: float):
                 risk = RiskManager(position_size_pct=position_size_pct)
                 executor = Executor(broker, risk)
                 listener = TelegramListener(
-                    executor, on_signal_callback=on_signal_callback
+                    executor,
+                    on_signal_callback=on_signal_callback,
+                    auth_state=_auth_state,
                 )
 
                 # Module-level refs (thread-safe); session_state is main-thread only
@@ -293,6 +301,31 @@ invert_signal = true""",
 
     if _shared_status.get("error"):
         st.error(_shared_status["error"])
+
+    # --- Interactive Telegram login (code / 2FA) ---
+    auth_status = _auth_state.get("status", "idle")
+    if auth_status == "awaiting_code":
+        st.warning("📱 Telegram wysłał kod – wpisz go poniżej")
+        code = st.text_input("Kod z Telegrama", key="tg_code_input")
+        if st.button("Wyślij kod") and code:
+            _auth_state["code"] = code.strip()
+            st.info("Kod przekazany – czekam na logowanie...")
+            st.rerun()
+    elif auth_status == "awaiting_password":
+        st.warning("🔒 Wymagane hasło 2FA")
+        pwd = st.text_input("Hasło 2FA", type="password", key="tg_pwd_input")
+        if st.button("Wyślij hasło") and pwd:
+            _auth_state["password"] = pwd
+            st.info("Hasło przekazane...")
+            st.rerun()
+    elif auth_status == "error" and _auth_state.get("error"):
+        st.error(f"Logowanie Telegram: {_auth_state['error']}")
+
+    # Show session string once so user can save it to secrets
+    if _auth_state.get("session_string") and auth_status in ("authorized", "running"):
+        with st.expander("💾 Zapisz sesję do secrets (żeby nie logować się ponownie)"):
+            st.caption("Wklej to do Streamlit Secrets jako telegram.session_string:")
+            st.code(_auth_state["session_string"])
 
     if st.button("🔄 Odśwież"):
         st.rerun()
