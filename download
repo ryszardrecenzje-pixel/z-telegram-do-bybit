@@ -41,3 +41,5 @@ Thumbs.db
 
 # Streamlit
 .streamlit/cache/
+data/auth_bridge.json
+data/*.session

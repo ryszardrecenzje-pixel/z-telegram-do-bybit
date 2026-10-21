@@ -20,6 +20,7 @@ from bot.brokers.binance_broker import BinanceBroker
 from bot.executor import Executor
 from bot.risk_manager import RiskManager
 from bot.telegram_listener import TelegramListener
+from bot import auth_bridge
 from config import config
 from utils.logger import get_logger
 
@@ -227,11 +228,9 @@ st.caption(
     "Nasłuchuje sygnałów z Twojego bota (Telethon) i wykonuje je na koncie demo / paper."
 )
 
-# Auto-refresh while waiting for Telegram code / 2FA (background thread cannot trigger UI)
-_auth_st = _auth_state.get("status", "idle")
-if _auth_st in ("sending_code", "awaiting_code", "awaiting_password") or (
-    _shared_status.get("bot_running") and _auth_st not in ("running", "authorized", "error", "stopped", "idle")
-):
+# Auto-refresh while waiting for Telegram code / 2FA
+_auth_st = auth_bridge.get_status()
+if _auth_st in ("sending_code", "awaiting_code", "awaiting_password"):
     try:
         from streamlit_autorefresh import st_autorefresh
         st_autorefresh(interval=2000, key="auth_refresh")
@@ -313,36 +312,43 @@ invert_signal = true""",
     if _shared_status.get("error"):
         st.error(_shared_status["error"])
 
-    # --- Interactive Telegram login (code / 2FA) ---
-    auth_status = _auth_state.get("status", "idle")
+    # --- Interactive Telegram login (code / 2FA) via file bridge ---
+    bridge = auth_bridge.get_all()
+    auth_status = bridge.get("status", "idle")
     st.caption(f"Auth status: `{auth_status}`")
+
     if auth_status == "sending_code":
         st.info("📤 Wysyłam prośbę o kod do Telegrama… odśwież za chwilę.")
-    elif auth_status == "awaiting_code":
+
+    # ALWAYS show code field when waiting OR when user may still have a code
+    if auth_status in ("awaiting_code", "sending_code", "idle", "error", "stopped"):
         st.warning(
-            "📱 **Kod jest w aplikacji Telegram** (czat „Telegram” / oficjalne powiadomienie), "
-            "rzadko jako SMS. Wpisz go poniżej."
+            "📱 Kod z Telegrama (aplikacja → oficjalna wiadomość „Telegram”). "
+            "Wpisz poniżej i kliknij Wyślij."
         )
         code = st.text_input("Kod z Telegrama", key="tg_code_input")
         if st.button("Wyślij kod", type="primary") and code:
-            _auth_state["code"] = code.strip()
-            st.success("Kod przekazany – logowanie…")
+            auth_bridge.submit_code(code.strip())
+            auth_bridge.set_status("awaiting_code")  # keep waiting state
+            st.success("Kod zapisany – bot powinien się zalogować. Odśwież za 2–3 s.")
             st.rerun()
-    elif auth_status == "awaiting_password":
+
+    if auth_status == "awaiting_password":
         st.warning("🔒 Wymagane hasło 2FA")
         pwd = st.text_input("Hasło 2FA", type="password", key="tg_pwd_input")
         if st.button("Wyślij hasło") and pwd:
-            _auth_state["password"] = pwd
-            st.info("Hasło przekazane...")
+            auth_bridge.submit_password(pwd)
+            st.info("Hasło zapisane…")
             st.rerun()
-    elif auth_status == "error" and _auth_state.get("error"):
-        st.error(f"Logowanie Telegram: {_auth_state['error']}")
 
-    # Show session string once so user can save it to secrets
-    if _auth_state.get("session_string") and auth_status in ("authorized", "running"):
+    if auth_status == "error" and bridge.get("error"):
+        st.error(f"Logowanie Telegram: {bridge['error']}")
+
+    sess = bridge.get("session_string") or auth_bridge.get_session_string()
+    if sess and auth_status in ("authorized", "running"):
         with st.expander("💾 Zapisz sesję do secrets (żeby nie logować się ponownie)"):
-            st.caption("Wklej to do Streamlit Secrets jako telegram.session_string:")
-            st.code(_auth_state["session_string"])
+            st.caption("Wklej do Streamlit Secrets jako telegram.session_string:")
+            st.code(sess)
 
     if st.button("🔄 Odśwież"):
         st.rerun()
