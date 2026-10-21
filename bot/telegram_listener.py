@@ -87,23 +87,7 @@ class TelegramListener:
             logger.exception("Could not export session string")
 
         signal_bot = config.SIGNAL_BOT_USERNAME.lstrip("@")
-
-        # Resolve bot entity (critical for polling + filtering)
-        try:
-            self._signal_bot_entity = await self.client.get_entity(signal_bot)
-            logger.info(
-                "Resolved signal bot: id=%s username=%s",
-                getattr(self._signal_bot_entity, "id", "?"),
-                getattr(self._signal_bot_entity, "username", "?"),
-            )
-        except Exception as e:
-            logger.error(
-                "Cannot resolve @%s – check username. Error: %s", signal_bot, e
-            )
-            raise RuntimeError(
-                f"Nie znaleziono bota @{signal_bot}. "
-                "Otwórz z nim czat w Telegramie i spróbuj ponownie."
-            ) from e
+        self._signal_bot_entity = await self._resolve_signal_bot(signal_bot)
 
         # Seed seen IDs with recent messages so we don't re-process history
         try:
@@ -142,6 +126,73 @@ class TelegramListener:
 
         self._task = asyncio.create_task(self.client.run_until_disconnected())
         self._poll_task = asyncio.create_task(self._poll_loop())
+
+
+    async def _resolve_signal_bot(self, signal_bot: str):
+        """
+        Resolve bot by @username, then by dialog title/name.
+        Display name in Telegram can differ from real @username.
+        """
+        # 1) Direct username resolve
+        try:
+            entity = await self.client.get_entity(signal_bot)
+            logger.info(
+                "Resolved by username @%s → id=%s username=%s",
+                signal_bot,
+                getattr(entity, "id", "?"),
+                getattr(entity, "username", "?"),
+            )
+            return entity
+        except Exception as e:
+            logger.warning("get_entity(@%s) failed: %s – searching dialogs...", signal_bot, e)
+
+        # 2) Search dialogs (private chats with bots)
+        target = signal_bot.lower().replace(" ", "")
+        matches = []
+        bot_dialogs_log = []
+        async for dialog in self.client.iter_dialogs():
+            entity = dialog.entity
+            is_bot = bool(getattr(entity, "bot", False))
+            uname = (getattr(entity, "username", None) or "") or ""
+            title = (dialog.name or "") or ""
+            first = (getattr(entity, "first_name", None) or "") or ""
+            if is_bot or dialog.is_user:
+                bot_dialogs_log.append(
+                    f"id={getattr(entity, 'id', '?')} bot={is_bot} "
+                    f"@{uname or '-'} title={title!r}"
+                )
+            if not (is_bot or dialog.is_user):
+                continue
+            # match username, title, or first_name
+            candidates = [uname.lower(), title.lower().replace(" ", ""), first.lower().replace(" ", "")]
+            if target in candidates or any(target in c for c in candidates if c):
+                matches.append(entity)
+                logger.info(
+                    "Dialog match: id=%s @{%s} title=%r",
+                    getattr(entity, "id", "?"),
+                    uname,
+                    title,
+                )
+
+        logger.info("Bot/user dialogs found (%d):", len(bot_dialogs_log))
+        for line in bot_dialogs_log[:40]:
+            logger.info("  %s", line)
+
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            # prefer exact username match
+            for m in matches:
+                if (getattr(m, "username", None) or "").lower() == target:
+                    return m
+            return matches[0]
+
+        raise RuntimeError(
+            f"Nie znaleziono bota pasującego do '{signal_bot}'. "
+            "W logach jest lista czatów – sprawdź prawdziwy @username bota "
+            "(w Telegramie: profil bota → jeśli jest @nazwa, wpisz ją w secrets jako signal_bot_username). "
+            "Otwórz też czat z botem na koncie, którym jesteś zalogowany (Rakszarani)."
+        )
 
     async def _poll_loop(self) -> None:
         """Fallback: poll private chat with signal bot for new messages."""
