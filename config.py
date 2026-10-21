@@ -137,8 +137,8 @@ class _Config:
     @property
     def SIGNAL_BOT_USERNAME(self) -> str:
         return str(
-            self._get("SIGNAL_BOT_USERNAME", "telegram", "signal_bot_username", "TraderRicziV2")
-            or "TraderRicziV2"
+            self._get("SIGNAL_BOT_USERNAME", "telegram", "signal_bot_username", "Riczi_trader_bot")
+            or "Riczi_trader_bot"
         )
 
     @property

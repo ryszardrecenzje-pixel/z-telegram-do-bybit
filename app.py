@@ -21,6 +21,7 @@ from bot.executor import Executor
 from bot.risk_manager import RiskManager
 from bot.telegram_listener import TelegramListener
 from bot import auth_bridge
+from bot import signal_store
 from config import config
 from utils.logger import get_logger
 
@@ -86,6 +87,16 @@ def on_signal_callback(signal, result) -> None:
     }
     with _lock:
         _shared_signals.appendleft(entry)
+    # Persist so UI survives Streamlit reruns (best-effort from this thread)
+    try:
+        import asyncio
+        loop = _runtime.get("loop")
+        if loop and loop.is_running():
+            asyncio.run_coroutine_threadsafe(signal_store.save_signal(entry), loop)
+        else:
+            asyncio.run(signal_store.save_signal(entry))
+    except Exception as e:
+        logger.warning("Could not persist signal: %s", e)
     add_log(
         f"{signal.action} {signal.symbol} signal={signal.side} → we={our_side} | "
         f"{'OK' if result.get('success') else 'FAIL'}: {result.get('message')}"
@@ -125,8 +136,10 @@ def start_bot_background(broker_type: str, position_size_pct: float):
             try:
                 if broker_type == "Paper (Demo)":
                     broker = PaperBroker(starting_balance=10_000.0)
+                elif broker_type == "Binance Testnet":
+                    broker = BinanceBroker(live=False)
                 else:
-                    broker = BinanceBroker()
+                    broker = BinanceBroker(live=True)
 
                 await broker.connect()
                 risk = RiskManager(position_size_pct=position_size_pct)
@@ -244,9 +257,13 @@ with st.sidebar:
 
     broker_type = st.selectbox(
         "Broker",
-        ["Paper (Demo)", "Binance (Testnet/Live)"],
+        ["Paper (Demo)", "Binance Testnet", "Binance Live"],
         index=0,
-        help="Na start zawsze używaj Paper. Binance tylko gdy masz klucze i chcesz krypto.",
+        help=(
+            "Paper = wirtualne konto. "
+            "Binance = USDT-M Futures (prawdziwy LONG/SHORT). "
+            "Live = prawdziwe środki. Symbole: AAPL→AAPLB (secrets [symbols])."
+        ),
     )
 
     position_size_pct = st.number_input(
@@ -371,6 +388,19 @@ with tab1:
     st.subheader("Ostatnie sygnały")
     with _lock:
         signals = list(_shared_signals)
+    # Merge with DB (survives reruns on same machine)
+    try:
+        import asyncio as _aio
+        db_signals = _aio.run(signal_store.load_signals(50))
+        # prefer in-memory first, then DB without duplicates by order_id/time
+        seen = {(s.get("order_id"), s.get("time")) for s in signals}
+        for s in db_signals:
+            key = (s.get("order_id"), s.get("time"))
+            if key not in seen:
+                signals.append(s)
+                seen.add(key)
+    except Exception:
+        pass
     if signals:
         st.dataframe(pd.DataFrame(signals), use_container_width=True)
     else:
@@ -451,7 +481,8 @@ st.markdown(
 **Uwagi bezpieczeństwa**
 - Klucze API i dane Telethon trzymaj wyłącznie w `.streamlit/secrets.toml` lub zmiennych środowiskowych.
 - Na początku zawsze używaj trybu **Paper (Demo)**.
-- Symbole typu WMT / BA / NOW to akcje – klasyczny Binance Spot ich nie obsłuży. Paper broker jest do tego stworzony.
+- Na Binance akcje są mapowane (AAPL→AAPLB, AMZN→AMZNB…). Własne mapowanie: secrets `[symbols] AAPL = "AAPLB"`.
+- **Binance Live** używa prawdziwych środków – najpierw testuj Paper / Testnet.
 - **Streamlit Cloud:** pierwsze logowanie Telethon (kod SMS) działa tylko lokalnie. Na Cloud wrzuć gotowy plik sesji `data/telethon.session`.
 """
 )
