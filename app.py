@@ -149,11 +149,13 @@ def start_bot_background(broker_type: str, position_size_pct: float):
                     _shared_status["error"] = None
                     _shared_status["broker_name"] = broker.name
 
+                has_sess = bool((config.TELEGRAM_SESSION_STRING or "").strip())
                 add_log(
                     f"Bot started ({broker.name}) | "
                     f"size={position_size_pct}% capital | "
                     f"invert={config.INVERT_SIGNAL} | "
-                    f"SL={config.SL_PCT}% TP={config.TP_PCT}%"
+                    f"SL={config.SL_PCT}% TP={config.TP_PCT}% | "
+                    f"session_string={'YES' if has_sess else 'NO'}"
                 )
 
                 await listener.start()
@@ -295,7 +297,13 @@ invert_signal = true""",
             )
 
     st.divider()
-    bot_running = _shared_status["bot_running"]
+    # Sync UI with auth_bridge (survives Streamlit reruns better than in-memory flag)
+    bridge_status = auth_bridge.get_status()
+    bot_running = bool(_shared_status["bot_running"] or bridge_status == "running")
+    if bridge_status == "running" and not _shared_status["bot_running"]:
+        # Thread may still be alive after a script rerun
+        _shared_status["bot_running"] = True
+
     col1, col2 = st.columns(2)
     with col1:
         if st.button("▶ Start bota", type="primary", disabled=bot_running):
@@ -306,7 +314,10 @@ invert_signal = true""",
             stop_bot()
             st.rerun()
 
-    status_label = "🟢 Działa" if bot_running else "🔴 Zatrzymany"
+    if bot_running:
+        status_label = "🟢 Działa (nasłuchuje @{})".format(config.SIGNAL_BOT_USERNAME)
+    else:
+        status_label = "🔴 Zatrzymany"
     st.markdown(f"**Status:** {status_label}")
 
     if _shared_status.get("error"):

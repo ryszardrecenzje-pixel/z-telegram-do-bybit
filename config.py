@@ -67,6 +67,16 @@ def _read_secret(section: str, key: str, default: Any = None) -> Any:
             except Exception:
                 pass
 
+            # 2b) Dotted flat: telegram.session_string = ...
+            try:
+                dotted = f"{section}.{key}"
+                if dotted in secrets:
+                    val = secrets[dotted]
+                    if val is not None and str(val).strip() != "":
+                        return val
+            except Exception:
+                pass
+
             # 3) Bare key
             try:
                 if key in secrets:
