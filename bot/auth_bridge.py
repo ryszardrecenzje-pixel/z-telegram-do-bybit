@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import time
-from pathlib import Path
 from typing import Any, Optional
 
 from config import DATA_DIR
@@ -87,6 +86,40 @@ def set_session_string(s: str) -> None:
 def get_session_string() -> Optional[str]:
     s = _read().get("session_string")
     return str(s) if s else None
+
+
+def clear_session_string() -> None:
+    data = _read()
+    data.pop("session_string", None)
+    _write(data)
+
+
+def set_force_relogin(value: bool = True) -> None:
+    """Next bot start ignores secrets session_string and does interactive login."""
+    data = _read()
+    if value:
+        data["force_relogin"] = True
+        data.pop("session_string", None)
+        data.pop("code", None)
+        data.pop("password", None)
+        data["status"] = "idle"
+    else:
+        data.pop("force_relogin", None)
+    data["updated_at"] = time.time()
+    _write(data)
+
+
+def pop_force_relogin() -> bool:
+    data = _read()
+    flag = bool(data.pop("force_relogin", False))
+    if flag:
+        data.pop("session_string", None)
+        _write(data)
+    return flag
+
+
+def is_force_relogin() -> bool:
+    return bool(_read().get("force_relogin"))
 
 
 def reset() -> None:

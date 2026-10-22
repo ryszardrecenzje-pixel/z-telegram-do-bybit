@@ -27,11 +27,8 @@ POLL_INTERVAL_SEC = 8
 
 AUTH_KEY_MSG = (
     "Sesja Telegram unieważniona (AuthKeyDuplicatedError). "
-    "Ta sama session_string była użyta z dwóch IP naraz "
-    "(np. lokalnie + Streamlit Cloud). "
-    "Wygeneruj NOWĄ sesję TYLKO lokalnie: python scripts/generate_session.py "
-    "i wklej session_string do Streamlit Secrets. "
-    "Nie uruchamiaj bota lokalnie i na Cloud jednocześnie z tą samą sesją."
+    "Kliknij w panelu «Ponowne logowanie Telegram», potem Start bota, "
+    "wpisz kod z aplikacji Telegram i skopiuj nowy session_string do Secrets."
 )
 
 
@@ -41,9 +38,11 @@ class TelegramListener:
         executor: Executor,
         on_signal_callback: Optional[Callable] = None,
         auth_state: Optional[dict] = None,
+        force_fresh_login: bool = False,
     ):
         self.executor = executor
         self.on_signal_callback = on_signal_callback
+        self.force_fresh_login = force_fresh_login
         self.client: Optional[TelegramClient] = None
         self._running = False
         self._task: Optional[asyncio.Task] = None
@@ -64,16 +63,25 @@ class TelegramListener:
                 "(get them at https://my.telegram.org/apps)"
             )
 
-        session_str = (config.TELEGRAM_SESSION_STRING or "").strip()
-        if not session_str:
-            session_str = (auth_bridge.get_session_string() or "").strip()
+        # force_relogin from UI button, or constructor flag
+        force = self.force_fresh_login or auth_bridge.pop_force_relogin()
+
+        session_str = ""
+        if not force:
+            session_str = (config.TELEGRAM_SESSION_STRING or "").strip()
+            if not session_str:
+                session_str = (auth_bridge.get_session_string() or "").strip()
+        else:
+            logger.info("FORCE fresh login – ignoring existing session_string")
+            auth_bridge.clear_session_string()
 
         if session_str:
             logger.info("Using StringSession")
             session = StringSession(session_str)
         else:
-            logger.info("Using file session: %s", config.SESSION_FILE)
-            session = config.SESSION_FILE
+            # Empty StringSession → interactive login (works on Streamlit Cloud via UI code input)
+            logger.info("No session – starting interactive login (code via Streamlit UI)")
+            session = StringSession()
 
         self.client = TelegramClient(
             session,
@@ -88,6 +96,7 @@ class TelegramListener:
         except AuthKeyDuplicatedError:
             self._fatal_auth = True
             auth_bridge.set_status("error", error=AUTH_KEY_MSG)
+            auth_bridge.set_force_relogin(True)
             raise RuntimeError(AUTH_KEY_MSG)
 
         me = await self.client.get_me()
@@ -112,6 +121,7 @@ class TelegramListener:
         except AuthKeyDuplicatedError:
             self._fatal_auth = True
             auth_bridge.set_status("error", error=AUTH_KEY_MSG)
+            auth_bridge.set_force_relogin(True)
             raise RuntimeError(AUTH_KEY_MSG)
         except Exception:
             logger.exception("Could not seed recent messages")
@@ -232,6 +242,7 @@ class TelegramListener:
                 self._running = False
                 logger.error(AUTH_KEY_MSG)
                 auth_bridge.set_status("error", error=AUTH_KEY_MSG)
+                auth_bridge.set_force_relogin(True)
                 try:
                     if self.client:
                         await self.client.disconnect()
@@ -286,7 +297,10 @@ class TelegramListener:
     async def _interactive_login(self) -> None:
         phone = config.TELEGRAM_PHONE
         if not phone:
-            raise RuntimeError("TELEGRAM_PHONE is required for first login")
+            raise RuntimeError(
+                "TELEGRAM_PHONE jest wymagany do logowania. "
+                "Dodaj w Streamlit Secrets: [telegram] phone = \"+48...\""
+            )
 
         logger.info("Sending login code to %s ...", phone)
         auth_bridge.set_status("sending_code", error=None)
