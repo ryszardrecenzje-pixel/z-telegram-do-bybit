@@ -80,7 +80,13 @@ def pop_password() -> Optional[str]:
 
 
 def set_session_string(s: str) -> None:
-    set_status(get_status() or "authorized", session_string=s)
+    data = _read()
+    data["session_string"] = s
+    data["status"] = data.get("status") or "authorized"
+    data["updated_at"] = time.time()
+    # Successful login always ends force-relogin mode
+    data.pop("force_relogin", None)
+    _write(data)
 
 
 def get_session_string() -> Optional[str]:
@@ -109,6 +115,18 @@ def set_force_relogin(value: bool = True) -> None:
     _write(data)
 
 
+def clear_force_relogin() -> None:
+    """Cancel force-relogin – next Start will use secrets session_string."""
+    data = _read()
+    data.pop("force_relogin", None)
+    data["updated_at"] = time.time()
+    if data.get("status") in ("error", "awaiting_code", "sending_code", "awaiting_password"):
+        data["status"] = "idle"
+    data.pop("code", None)
+    data.pop("password", None)
+    _write(data)
+
+
 def pop_force_relogin() -> bool:
     data = _read()
     flag = bool(data.pop("force_relogin", False))
@@ -133,4 +151,5 @@ def force_stopped() -> None:
     data["updated_at"] = time.time()
     data.pop("code", None)
     data.pop("password", None)
+    # Do NOT clear force_relogin here – user may have armed it intentionally
     _write(data)
