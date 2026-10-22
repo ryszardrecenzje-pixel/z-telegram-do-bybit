@@ -25,8 +25,11 @@ def _read() -> dict:
 
 
 def _write(data: dict) -> None:
-    DATA_DIR.mkdir(exist_ok=True)
-    BRIDGE_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        BRIDGE_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
 
 
 def set_status(status: str, **extra: Any) -> None:
@@ -88,3 +91,13 @@ def get_session_string() -> Optional[str]:
 
 def reset() -> None:
     _write({"status": "idle", "updated_at": time.time()})
+
+
+def force_stopped() -> None:
+    """Hard-set stopped so UI never sticks on green after Stop."""
+    data = _read()
+    data["status"] = "stopped"
+    data["updated_at"] = time.time()
+    data.pop("code", None)
+    data.pop("password", None)
+    _write(data)

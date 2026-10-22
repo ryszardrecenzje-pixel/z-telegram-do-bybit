@@ -16,12 +16,33 @@ from dotenv import load_dotenv
 load_dotenv()
 
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
-DATA_DIR.mkdir(exist_ok=True)
+
+
+def _writable_data_dir() -> Path:
+    """
+    Prefer project data/ when writable; on Streamlit Cloud use /tmp so SQLite
+    and auth bridge can actually persist within the container lifetime.
+    """
+    local = BASE_DIR / "data"
+    try:
+        local.mkdir(parents=True, exist_ok=True)
+        probe = local / ".write_test"
+        probe.write_text("ok", encoding="utf-8")
+        probe.unlink(missing_ok=True)
+        return local
+    except Exception:
+        pass
+    tmp = Path(os.environ.get("TMPDIR", "/tmp")) / "z-telegram-do-bybit"
+    tmp.mkdir(parents=True, exist_ok=True)
+    return tmp
+
+
+DATA_DIR = _writable_data_dir()
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 DB_PATH = DATA_DIR / "trading.db"
 SESSION_DIR = DATA_DIR
-SESSION_DIR.mkdir(exist_ok=True)
+SESSION_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def _read_secret(section: str, key: str, default: Any = None) -> Any:
@@ -198,6 +219,8 @@ class _Config:
             "sl_pct": self.SL_PCT,
             "tp_pct": self.TP_PCT,
             "invert_signal": self.INVERT_SIGNAL,
+            "data_dir": str(DATA_DIR),
+            "db_path": str(DB_PATH),
         }
 
 
