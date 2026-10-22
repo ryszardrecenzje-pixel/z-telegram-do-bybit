@@ -13,7 +13,6 @@ from typing import Callable, Optional, Set
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError
 from telethon.sessions import StringSession
-from telethon.tl.types import User
 
 from bot import auth_bridge
 from bot.executor import Executor
@@ -122,18 +121,20 @@ class TelegramListener:
 
         self._running = True
         auth_bridge.set_status("running")
-        logger.info("Listening for signals from @%s (push + poll every %ss)", signal_bot, POLL_INTERVAL_SEC)
+        logger.info(
+            "Listening for signals from @%s (push + poll every %ss)",
+            signal_bot,
+            POLL_INTERVAL_SEC,
+        )
 
         self._task = asyncio.create_task(self.client.run_until_disconnected())
         self._poll_task = asyncio.create_task(self._poll_loop())
-
 
     async def _resolve_signal_bot(self, signal_bot: str):
         """
         Resolve bot by @username, then by dialog title/name.
         Display name in Telegram can differ from real @username.
         """
-        # 1) Direct username resolve
         try:
             entity = await self.client.get_entity(signal_bot)
             logger.info(
@@ -146,7 +147,6 @@ class TelegramListener:
         except Exception as e:
             logger.warning("get_entity(@%s) failed: %s – searching dialogs...", signal_bot, e)
 
-        # 2) Search dialogs (private chats with bots)
         target = signal_bot.lower().replace(" ", "")
         matches = []
         bot_dialogs_log = []
@@ -163,12 +163,15 @@ class TelegramListener:
                 )
             if not (is_bot or dialog.is_user):
                 continue
-            # match username, title, or first_name
-            candidates = [uname.lower(), title.lower().replace(" ", ""), first.lower().replace(" ", "")]
+            candidates = [
+                uname.lower(),
+                title.lower().replace(" ", ""),
+                first.lower().replace(" ", ""),
+            ]
             if target in candidates or any(target in c for c in candidates if c):
                 matches.append(entity)
                 logger.info(
-                    "Dialog match: id=%s @{%s} title=%r",
+                    "Dialog match: id=%s @%s title=%r",
                     getattr(entity, "id", "?"),
                     uname,
                     title,
@@ -181,7 +184,6 @@ class TelegramListener:
         if len(matches) == 1:
             return matches[0]
         if len(matches) > 1:
-            # prefer exact username match
             for m in matches:
                 if (getattr(m, "username", None) or "").lower() == target:
                     return m
@@ -191,7 +193,7 @@ class TelegramListener:
             f"Nie znaleziono bota pasującego do '{signal_bot}'. "
             "W logach jest lista czatów – sprawdź prawdziwy @username bota "
             "(w Telegramie: profil bota → jeśli jest @nazwa, wpisz ją w secrets jako signal_bot_username). "
-            "Otwórz też czat z botem na koncie, którym jesteś zalogowany (Rakszarani)."
+            "Otwórz też czat z botem na koncie, którym jesteś zalogowany."
         )
 
     async def _poll_loop(self) -> None:
@@ -202,13 +204,12 @@ class TelegramListener:
                 if not self._running or not self.client or not self._signal_bot_entity:
                     continue
                 messages = await self.client.get_messages(self._signal_bot_entity, limit=10)
-                for msg in reversed(list(messages)):  # oldest first
+                for msg in reversed(list(messages)):
                     if not msg or not msg.id:
                         continue
                     if msg.id in self._seen_ids:
                         continue
                     self._seen_ids.add(msg.id)
-                    # keep set bounded
                     if len(self._seen_ids) > 500:
                         self._seen_ids = set(sorted(self._seen_ids)[-300:])
                     await self._handle_message(msg)
@@ -238,7 +239,6 @@ class TelegramListener:
             logger.info("Not a SIGNAL format – ignored")
             return
 
-        # mark as processed signal
         if not hasattr(self, "_processed_signals"):
             self._processed_signals = set()
         if mid is not None:
@@ -308,7 +308,10 @@ class TelegramListener:
 
     async def stop(self) -> None:
         self._running = False
-        auth_bridge.set_status("stopped")
+        try:
+            auth_bridge.force_stopped()
+        except Exception:
+            auth_bridge.set_status("stopped")
         for t in (self._poll_task, self._task):
             if t:
                 t.cancel()
@@ -316,10 +319,15 @@ class TelegramListener:
                     await t
                 except asyncio.CancelledError:
                     pass
+                except Exception:
+                    pass
         self._poll_task = None
         self._task = None
         if self.client:
-            await self.client.disconnect()
+            try:
+                await self.client.disconnect()
+            except Exception:
+                pass
             self.client = None
         logger.info("Telegram listener stopped")
 
