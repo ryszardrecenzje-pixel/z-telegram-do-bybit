@@ -92,12 +92,6 @@ def on_signal_callback(signal, result) -> None:
         signal_store.save_signal_sync(entry)
     except Exception as e:
         logger.warning("Could not persist signal (sync): %s", e)
-        try:
-            loop = _runtime.get("loop")
-            if loop and loop.is_running():
-                asyncio.run_coroutine_threadsafe(signal_store.save_signal(entry), loop)
-        except Exception as e2:
-            logger.warning("Could not persist signal (async): %s", e2)
 
     add_log(
         f"{signal.action} {signal.symbol} signal={signal.side} → we={our_side} | "
@@ -106,14 +100,13 @@ def on_signal_callback(signal, result) -> None:
 
 
 def init_state():
-    defaults = {
+    for k, v in {
         "listener": None,
         "broker": None,
         "executor": None,
         "loop": None,
         "thread": None,
-    }
-    for k, v in defaults.items():
+    }.items():
         if k not in st.session_state:
             st.session_state[k] = v
 
@@ -122,13 +115,18 @@ init_state()
 
 
 def start_bot_background(broker_type: str, position_size_pct: float):
-    with _lock:
-        if _shared_status["bot_running"]:
+    # Already running according to file flag?
+    if auth_bridge.is_bot_running_file():
+        t = _runtime.get("thread")
+        if t is not None and t.is_alive():
+            add_log("Bot already running – ignore Start")
             return
+
+    with _lock:
         _shared_status["stop_requested"] = False
         _shared_status["error"] = None
+        _shared_status["bot_running"] = True  # optimistic – UI updates immediately
 
-    # Prefer secrets session – only force login if flag is explicitly set
     force_login = auth_bridge.is_force_relogin()
     config.reload()
     has_secrets_session = bool((config.TELEGRAM_SESSION_STRING or "").strip())
@@ -168,6 +166,8 @@ def start_bot_background(broker_type: str, position_size_pct: float):
                     _shared_status["broker_name"] = broker.name
                     _shared_status["stop_requested"] = False
 
+                auth_bridge.set_bot_running(True, broker_name=broker.name)
+
                 add_log(
                     f"Bot started ({broker.name}) | "
                     f"size={position_size_pct}% capital | "
@@ -178,11 +178,21 @@ def start_bot_background(broker_type: str, position_size_pct: float):
                 )
 
                 await listener.start()
+                # Keep event loop alive until stop requested
+                while True:
+                    with _lock:
+                        if _shared_status.get("stop_requested"):
+                            break
+                    if not auth_bridge.is_bot_running_file():
+                        break
+                    await asyncio.sleep(0.5)
+
             except Exception as e:
                 logger.exception("Bot start failed")
                 with _lock:
                     _shared_status["bot_running"] = False
                     _shared_status["error"] = str(e)
+                auth_bridge.set_bot_running(False)
                 try:
                     auth_bridge.set_status("error", error=str(e))
                 except Exception:
@@ -191,11 +201,6 @@ def start_bot_background(broker_type: str, position_size_pct: float):
 
         try:
             loop.run_until_complete(main())
-            while True:
-                with _lock:
-                    if _shared_status.get("stop_requested") or not _shared_status.get("bot_running"):
-                        break
-                loop.run_until_complete(asyncio.sleep(0.5))
         except Exception as e:
             logger.exception("Event loop error")
             with _lock:
@@ -205,16 +210,7 @@ def start_bot_background(broker_type: str, position_size_pct: float):
         finally:
             with _lock:
                 _shared_status["bot_running"] = False
-            try:
-                if auth_bridge.get_status() not in (
-                    "error",
-                    "awaiting_code",
-                    "awaiting_password",
-                    "sending_code",
-                ):
-                    auth_bridge.force_stopped()
-            except Exception:
-                pass
+            auth_bridge.set_bot_running(False)
             try:
                 loop.close()
             except Exception:
@@ -224,7 +220,7 @@ def start_bot_background(broker_type: str, position_size_pct: float):
     _runtime["thread"] = t
     st.session_state.thread = t
     t.start()
-    time.sleep(0.8)
+    time.sleep(1.0)
 
 
 def stop_bot():
@@ -232,45 +228,43 @@ def stop_bot():
         _shared_status["stop_requested"] = True
         _shared_status["bot_running"] = False
 
+    auth_bridge.set_bot_running(False)
     try:
         auth_bridge.force_stopped()
     except Exception:
-        try:
-            auth_bridge.set_status("stopped")
-        except Exception:
-            pass
+        pass
 
     listener: Optional[TelegramListener] = _runtime.get("listener")
     broker = _runtime.get("broker")
     loop = _runtime.get("loop")
 
-    if listener and loop and getattr(loop, "is_running", lambda: False)():
+    if listener and loop:
+        try:
+            if loop.is_running():
 
-        async def _stop():
-            try:
-                await listener.stop()
-            except Exception as e:
-                add_log(f"Listener stop: {e}")
-            if broker:
+                async def _stop():
+                    try:
+                        await listener.stop()
+                    except Exception as e:
+                        add_log(f"Listener stop: {e}")
+                    if broker:
+                        try:
+                            await broker.disconnect()
+                        except Exception as e:
+                            add_log(f"Broker disconnect: {e}")
+
                 try:
-                    await broker.disconnect()
+                    fut = asyncio.run_coroutine_threadsafe(_stop(), loop)
+                    fut.result(timeout=10)
                 except Exception as e:
-                    add_log(f"Broker disconnect: {e}")
+                    add_log(f"Stop error: {e}")
 
-        try:
-            fut = asyncio.run_coroutine_threadsafe(_stop(), loop)
-            fut.result(timeout=15)
+                try:
+                    loop.call_soon_threadsafe(loop.stop)
+                except Exception:
+                    pass
         except Exception as e:
-            add_log(f"Stop error: {e}")
-
-        try:
-            loop.call_soon_threadsafe(loop.stop)
-        except Exception:
-            pass
-
-    with _lock:
-        _shared_status["bot_running"] = False
-        _shared_status["stop_requested"] = True
+            add_log(f"Stop cleanup: {e}")
 
     _runtime["listener"] = None
     _runtime["broker"] = None
@@ -280,31 +274,40 @@ def stop_bot():
 
 
 def _is_bot_running() -> bool:
-    with _lock:
-        if _shared_status.get("stop_requested"):
-            return False
-        running = bool(_shared_status.get("bot_running"))
+    """UI source of truth: file flag + optional live thread."""
+    file_running = auth_bridge.is_bot_running_file()
 
-    if not running:
+    with _lock:
+        mem_running = bool(_shared_status.get("bot_running"))
+        stop_req = bool(_shared_status.get("stop_requested"))
+
+    if stop_req:
         return False
 
     t = _runtime.get("thread")
-    if t is not None and not t.is_alive():
-        with _lock:
-            _shared_status["bot_running"] = False
+    thread_alive = t is not None and t.is_alive()
+
+    # Prefer live thread if we have one
+    if thread_alive and (mem_running or file_running):
+        return True
+
+    # After Streamlit rerun memory is empty but file says running
+    if file_running and not thread_alive:
+        # Stale file flag from killed process – clear it
+        # (unless we just started and thread not yet registered)
+        age_ok = True
         try:
-            if auth_bridge.get_status() not in (
-                "error",
-                "awaiting_code",
-                "awaiting_password",
-                "sending_code",
-            ):
-                auth_bridge.force_stopped()
+            data = auth_bridge.get_all()
+            updated = float(data.get("bot_updated_at") or 0)
+            if updated and (time.time() - updated) > 120:
+                auth_bridge.set_bot_running(False)
+                return False
         except Exception:
             pass
-        return False
+        # recently set – show as running (thread may be in other worker)
+        return age_ok and file_running
 
-    return True
+    return bool(mem_running and thread_alive)
 
 
 # ---------------------------------------------------------------------------
@@ -317,14 +320,15 @@ st.caption(
 )
 
 _auth_st = auth_bridge.get_status()
-if _auth_st in ("sending_code", "awaiting_code", "awaiting_password") or _is_bot_running():
+bot_running = _is_bot_running()
+
+if _auth_st in ("sending_code", "awaiting_code", "awaiting_password") or bot_running:
     try:
         from streamlit_autorefresh import st_autorefresh
 
-        st_autorefresh(interval=2500, key="ui_refresh")
+        st_autorefresh(interval=3000, key="ui_refresh")
     except ImportError:
-        if _auth_st in ("sending_code", "awaiting_code", "awaiting_password"):
-            st.info("⏳ Czekam na logowanie Telegram… klikaj **🔄 Odśwież** co 2–3 s.")
+        pass
 
 with st.sidebar:
     st.header("Ustawienia")
@@ -333,11 +337,6 @@ with st.sidebar:
         "Broker",
         ["Paper (Demo)", "Binance Testnet", "Binance Live"],
         index=0,
-        help=(
-            "Paper = wirtualne konto. "
-            "Binance = USDT-M Futures. "
-            "Live = prawdziwe środki."
-        ),
     )
 
     position_size_pct = st.number_input(
@@ -349,9 +348,8 @@ with st.sidebar:
     )
 
     st.info(
-        f"**Strategia:** sygnał odwracany  "
-        f"(LONG→SHORT / SHORT→LONG)  |  "
-        f"SL **{config.SL_PCT}%**  ·  TP **{config.TP_PCT}%**"
+        f"**Strategia:** sygnał odwracany | "
+        f"SL **{config.SL_PCT}%** · TP **{config.TP_PCT}%**"
     )
 
     st.divider()
@@ -361,19 +359,14 @@ with st.sidebar:
     status = config.status_summary()
     if status["telegram_api_id_set"] and status["telegram_api_hash_set"]:
         st.success("Telegram: API ID + Hash ustawione")
-    elif status["telegram_api_id_set"]:
-        st.warning("Jest API ID, ale brak API HASH")
     else:
-        st.error("Brak TELEGRAM_API_ID – uzupełnij secrets")
+        st.error("Brak TELEGRAM_API_ID / HASH w secrets")
 
     has_sess = bool((config.TELEGRAM_SESSION_STRING or "").strip())
     if has_sess:
         st.success("session_string w Secrets: TAK")
     else:
         st.warning("Brak session_string w Secrets")
-
-    if not status.get("telegram_phone_set"):
-        st.caption("phone w secrets potrzebny tylko do pierwszego / ponownego logowania")
 
     st.divider()
     bot_running = _is_bot_running()
@@ -394,97 +387,77 @@ with st.sidebar:
             _shared_status["bot_running"] = False
             _shared_status["stop_requested"] = True
             _shared_status["error"] = None
-        try:
-            auth_bridge.force_stopped()
-            # If secrets already have session – clear force-relogin so Start uses it
-            if has_sess:
-                auth_bridge.clear_force_relogin()
-        except Exception:
-            pass
+        auth_bridge.set_bot_running(False)
+        auth_bridge.force_stopped()
+        if has_sess:
+            auth_bridge.clear_force_relogin()
         add_log("Status force-reset by user")
         st.rerun()
 
-    # --- Re-login without local machine ---
     st.divider()
     st.subheader("Ponowne logowanie")
-    st.caption(
-        "Tylko gdy sesja padła (AuthKeyDuplicated). "
-        "Jeśli masz już session_string w Secrets – NIE klikaj tego."
-    )
+    st.caption("Tylko gdy sesja padła (AuthKeyDuplicated).")
 
     force_on = auth_bridge.is_force_relogin()
-
     if force_on:
-        st.warning("⚡ Tryb kodu aktywny – bot IGNORUJE session_string z Secrets")
+        st.warning("⚡ Tryb kodu – ignoruje session_string")
         if st.button("✅ Anuluj – użyj sesji z Secrets", type="primary"):
             auth_bridge.clear_force_relogin()
-            with _lock:
-                _shared_status["error"] = None
-            add_log("Force re-login CANCELLED – next Start will use secrets session_string")
-            st.success("OK. Kliknij ▶ Start bota – bez kodu.")
+            add_log("Force re-login CANCELLED")
             st.rerun()
     else:
         if st.button("🔐 Ponowne logowanie Telegram", disabled=bot_running):
             stop_bot()
             auth_bridge.set_force_relogin(True)
-            with _lock:
-                _shared_status["error"] = None
-                _shared_status["bot_running"] = False
-                _shared_status["stop_requested"] = True
-            add_log("Force re-login armed – next Start will request Telegram code")
+            add_log("Force re-login armed")
             st.rerun()
 
+    bot_running = _is_bot_running()
     if bot_running:
-        bn = _shared_status.get("broker_name") or "?"
-        status_label = f"🟢 Działa ({bn}) – nasłuchuje @{config.SIGNAL_BOT_USERNAME}"
+        bn = (
+            _shared_status.get("broker_name")
+            or auth_bridge.get_broker_name()
+            or "?"
+        )
+        st.markdown(
+            f"**Status:** 🟢 Działa ({bn}) – @{config.SIGNAL_BOT_USERNAME}"
+        )
     else:
-        status_label = "🔴 Zatrzymany"
-    st.markdown(f"**Status:** {status_label}")
+        st.markdown("**Status:** 🔴 Zatrzymany")
 
     if _shared_status.get("error"):
         st.error(_shared_status["error"])
 
     bridge = auth_bridge.get_all()
     auth_status = bridge.get("status", "idle")
-    st.caption(f"Auth status: `{auth_status}`")
+    st.caption(f"Auth status: `{auth_status}` | file_running=`{auth_bridge.is_bot_running_file()}`")
 
-    # Code / 2FA form only when actually logging in
     need_code = force_on or auth_status in (
         "sending_code",
         "awaiting_code",
         "awaiting_password",
     )
-
     if need_code:
         if auth_status == "sending_code":
-            st.info("📤 Wysyłam prośbę o kod do Telegrama… odśwież za chwilę.")
-
-        if auth_status in ("awaiting_code", "sending_code", "idle", "error", "stopped") or force_on:
-            st.warning(
-                "📱 Kod z Telegrama (aplikacja → oficjalna wiadomość «Telegram»)."
-            )
-            code = st.text_input("Kod z Telegrama", key="tg_code_input")
-            if st.button("Wyślij kod", type="primary") and code:
-                auth_bridge.submit_code(code.strip())
-                auth_bridge.set_status("awaiting_code")
-                st.success("Kod zapisany – odśwież za 2–3 s.")
-                st.rerun()
-
+            st.info("📤 Wysyłam kod…")
+        st.warning("📱 Kod z aplikacji Telegram")
+        code = st.text_input("Kod z Telegrama", key="tg_code_input")
+        if st.button("Wyślij kod", type="primary") and code:
+            auth_bridge.submit_code(code.strip())
+            auth_bridge.set_status("awaiting_code")
+            st.rerun()
         if auth_status == "awaiting_password":
-            st.warning("🔒 Wymagane hasło 2FA")
             pwd = st.text_input("Hasło 2FA", type="password", key="tg_pwd_input")
             if st.button("Wyślij hasło") and pwd:
                 auth_bridge.submit_password(pwd)
-                st.info("Hasło zapisane…")
                 st.rerun()
 
     if auth_status == "error" and bridge.get("error"):
-        st.error(f"Logowanie Telegram: {bridge['error']}")
+        st.error(str(bridge["error"]))
 
     sess = bridge.get("session_string") or auth_bridge.get_session_string()
     if sess and auth_status in ("authorized", "running"):
-        with st.expander("💾 Zapisz sesję do Secrets", expanded=True):
-            st.caption("Wklej jako telegram.session_string, potem Save.")
+        with st.expander("💾 Zapisz sesję do Secrets"):
             st.code(sess)
 
     if st.button("🔄 Odśwież"):
@@ -505,19 +478,13 @@ with tab1:
             if key not in seen:
                 signals.append(s)
                 seen.add(key)
-    except Exception as e:
-        logger.warning("UI load signals failed: %s", e)
-
+    except Exception:
+        pass
     if signals:
-        try:
-            signals = sorted(signals, key=lambda x: x.get("time") or "", reverse=True)
-        except Exception:
-            pass
+        signals = sorted(signals, key=lambda x: x.get("time") or "", reverse=True)
         st.dataframe(pd.DataFrame(signals), use_container_width=True)
     else:
-        st.info(
-            "Brak przetworzonych sygnałów. Uruchom bota i poczekaj na wiadomość od sygnałowego bota."
-        )
+        st.info("Brak przetworzonych sygnałów.")
 
 with tab2:
     st.subheader("Otwarte pozycje")
@@ -531,12 +498,10 @@ with tab2:
             bal = asyncio.run_coroutine_threadsafe(broker.get_balance(), loop).result(
                 timeout=5
             )
-
             c1, c2, c3 = st.columns(3)
             c1.metric("Cash", f"{bal.get('cash', 0):.2f} {bal.get('currency', '')}")
             c2.metric("Equity", f"{bal.get('equity', 0):.2f}")
             c3.metric("Otwarte pozycje", bal.get("open_positions", 0))
-
             if positions:
                 rows = [
                     {
@@ -546,8 +511,6 @@ with tab2:
                         "Entry": p.entry_price,
                         "SL": p.sl,
                         "TP": p.tp,
-                        "Score": p.signal_score,
-                        "Opened": p.opened_at.isoformat(timespec="seconds"),
                     }
                     for p in positions
                 ]
@@ -584,14 +547,10 @@ with tab4:
     if logs:
         st.code("\n".join(logs), language="text")
     else:
-        st.write("Brak logów.")
+        st.write("Brak logów – po starcie pojawią się tutaj.")
 
 st.divider()
-st.markdown(
-    """
-**Uwagi**
-- Masz `session_string` w Secrets → **nie** klikaj «Ponowne logowanie».
-- Jeśli znowu prosi o kod: kliknij **✅ Anuluj – użyj sesji z Secrets**, potem Start.
-- Jedna sesja = tylko Cloud (nie lokalnie jednocześnie).
-"""
+st.caption(
+    "Masz session_string w Secrets → tylko Start. "
+    "Nie klikaj Ponowne logowanie, chyba że AuthKeyDuplicated."
 )
