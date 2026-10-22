@@ -128,7 +128,10 @@ def start_bot_background(broker_type: str, position_size_pct: float):
         _shared_status["stop_requested"] = False
         _shared_status["error"] = None
 
+    # Prefer secrets session – only force login if flag is explicitly set
     force_login = auth_bridge.is_force_relogin()
+    config.reload()
+    has_secrets_session = bool((config.TELEGRAM_SESSION_STRING or "").strip())
 
     def run():
         loop = asyncio.new_event_loop()
@@ -165,13 +168,12 @@ def start_bot_background(broker_type: str, position_size_pct: float):
                     _shared_status["broker_name"] = broker.name
                     _shared_status["stop_requested"] = False
 
-                has_sess = bool((config.TELEGRAM_SESSION_STRING or "").strip()) and not force_login
                 add_log(
                     f"Bot started ({broker.name}) | "
                     f"size={position_size_pct}% capital | "
                     f"invert={config.INVERT_SIGNAL} | "
                     f"SL={config.SL_PCT}% TP={config.TP_PCT}% | "
-                    f"session_string={'YES' if has_sess else 'NO (fresh login)'} | "
+                    f"secrets_session={'YES' if has_secrets_session else 'NO'} | "
                     f"force_relogin={force_login}"
                 )
 
@@ -204,8 +206,12 @@ def start_bot_background(broker_type: str, position_size_pct: float):
             with _lock:
                 _shared_status["bot_running"] = False
             try:
-                # keep error status if set; otherwise mark stopped
-                if auth_bridge.get_status() not in ("error", "awaiting_code", "awaiting_password", "sending_code"):
+                if auth_bridge.get_status() not in (
+                    "error",
+                    "awaiting_code",
+                    "awaiting_password",
+                    "sending_code",
+                ):
                     auth_bridge.force_stopped()
             except Exception:
                 pass
@@ -239,6 +245,7 @@ def stop_bot():
     loop = _runtime.get("loop")
 
     if listener and loop and getattr(loop, "is_running", lambda: False)():
+
         async def _stop():
             try:
                 await listener.stop()
@@ -286,7 +293,12 @@ def _is_bot_running() -> bool:
         with _lock:
             _shared_status["bot_running"] = False
         try:
-            if auth_bridge.get_status() not in ("error", "awaiting_code", "awaiting_password", "sending_code"):
+            if auth_bridge.get_status() not in (
+                "error",
+                "awaiting_code",
+                "awaiting_password",
+                "sending_code",
+            ):
                 auth_bridge.force_stopped()
         except Exception:
             pass
@@ -354,8 +366,14 @@ with st.sidebar:
     else:
         st.error("Brak TELEGRAM_API_ID – uzupełnij secrets")
 
+    has_sess = bool((config.TELEGRAM_SESSION_STRING or "").strip())
+    if has_sess:
+        st.success("session_string w Secrets: TAK")
+    else:
+        st.warning("Brak session_string w Secrets")
+
     if not status.get("telegram_phone_set"):
-        st.warning("Brak phone w secrets – potrzebny do ponownego logowania")
+        st.caption("phone w secrets potrzebny tylko do pierwszego / ponownego logowania")
 
     st.divider()
     bot_running = _is_bot_running()
@@ -378,6 +396,9 @@ with st.sidebar:
             _shared_status["error"] = None
         try:
             auth_bridge.force_stopped()
+            # If secrets already have session – clear force-relogin so Start uses it
+            if has_sess:
+                auth_bridge.clear_force_relogin()
         except Exception:
             pass
         add_log("Status force-reset by user")
@@ -387,25 +408,31 @@ with st.sidebar:
     st.divider()
     st.subheader("Ponowne logowanie")
     st.caption(
-        "Gdy sesja padła (AuthKeyDuplicated) albo chcesz nową sesję – "
-        "bez generowania lokalnie."
+        "Tylko gdy sesja padła (AuthKeyDuplicated). "
+        "Jeśli masz już session_string w Secrets – NIE klikaj tego."
     )
-    if st.button("🔐 Ponowne logowanie Telegram", disabled=bot_running):
-        stop_bot()
-        auth_bridge.set_force_relogin(True)
-        with _lock:
-            _shared_status["error"] = None
-            _shared_status["bot_running"] = False
-            _shared_status["stop_requested"] = True
-        add_log("Force re-login armed – next Start will request Telegram code")
-        st.success(
-            "Gotowe. Kliknij **▶ Start bota**. "
-            "Kod przyjdzie do aplikacji Telegram – wpisz go poniżej."
-        )
-        st.rerun()
 
-    if auth_bridge.is_force_relogin():
-        st.warning("⚡ Tryb nowego logowania aktywny – Start poprosi o kod SMS/Telegram")
+    force_on = auth_bridge.is_force_relogin()
+
+    if force_on:
+        st.warning("⚡ Tryb kodu aktywny – bot IGNORUJE session_string z Secrets")
+        if st.button("✅ Anuluj – użyj sesji z Secrets", type="primary"):
+            auth_bridge.clear_force_relogin()
+            with _lock:
+                _shared_status["error"] = None
+            add_log("Force re-login CANCELLED – next Start will use secrets session_string")
+            st.success("OK. Kliknij ▶ Start bota – bez kodu.")
+            st.rerun()
+    else:
+        if st.button("🔐 Ponowne logowanie Telegram", disabled=bot_running):
+            stop_bot()
+            auth_bridge.set_force_relogin(True)
+            with _lock:
+                _shared_status["error"] = None
+                _shared_status["bot_running"] = False
+                _shared_status["stop_requested"] = True
+            add_log("Force re-login armed – next Start will request Telegram code")
+            st.rerun()
 
     if bot_running:
         bn = _shared_status.get("broker_name") or "?"
@@ -421,44 +448,44 @@ with st.sidebar:
     auth_status = bridge.get("status", "idle")
     st.caption(f"Auth status: `{auth_status}`")
 
-    if auth_status == "sending_code":
-        st.info("📤 Wysyłam prośbę o kod do Telegrama… odśwież za chwilę.")
+    # Code / 2FA form only when actually logging in
+    need_code = force_on or auth_status in (
+        "sending_code",
+        "awaiting_code",
+        "awaiting_password",
+    )
 
-    if auth_status in ("awaiting_code", "sending_code", "idle", "error", "stopped"):
-        st.warning(
-            "📱 Kod z Telegrama (aplikacja → oficjalna wiadomość «Telegram»). "
-            "Wpisz poniżej i kliknij Wyślij."
-        )
-        code = st.text_input("Kod z Telegrama", key="tg_code_input")
-        if st.button("Wyślij kod", type="primary") and code:
-            auth_bridge.submit_code(code.strip())
-            auth_bridge.set_status("awaiting_code")
-            st.success("Kod zapisany – bot powinien się zalogować. Odśwież za 2–3 s.")
-            st.rerun()
+    if need_code:
+        if auth_status == "sending_code":
+            st.info("📤 Wysyłam prośbę o kod do Telegrama… odśwież za chwilę.")
 
-    if auth_status == "awaiting_password":
-        st.warning("🔒 Wymagane hasło 2FA")
-        pwd = st.text_input("Hasło 2FA", type="password", key="tg_pwd_input")
-        if st.button("Wyślij hasło") and pwd:
-            auth_bridge.submit_password(pwd)
-            st.info("Hasło zapisane…")
-            st.rerun()
+        if auth_status in ("awaiting_code", "sending_code", "idle", "error", "stopped") or force_on:
+            st.warning(
+                "📱 Kod z Telegrama (aplikacja → oficjalna wiadomość «Telegram»)."
+            )
+            code = st.text_input("Kod z Telegrama", key="tg_code_input")
+            if st.button("Wyślij kod", type="primary") and code:
+                auth_bridge.submit_code(code.strip())
+                auth_bridge.set_status("awaiting_code")
+                st.success("Kod zapisany – odśwież za 2–3 s.")
+                st.rerun()
+
+        if auth_status == "awaiting_password":
+            st.warning("🔒 Wymagane hasło 2FA")
+            pwd = st.text_input("Hasło 2FA", type="password", key="tg_pwd_input")
+            if st.button("Wyślij hasło") and pwd:
+                auth_bridge.submit_password(pwd)
+                st.info("Hasło zapisane…")
+                st.rerun()
 
     if auth_status == "error" and bridge.get("error"):
         st.error(f"Logowanie Telegram: {bridge['error']}")
 
     sess = bridge.get("session_string") or auth_bridge.get_session_string()
     if sess and auth_status in ("authorized", "running"):
-        with st.expander("💾 WAŻNE: zapisz nową sesję do Secrets", expanded=True):
-            st.caption(
-                "Wklej do Streamlit Secrets jako telegram.session_string "
-                "(zastąp starą wartość), potem Save."
-            )
+        with st.expander("💾 Zapisz sesję do Secrets", expanded=True):
+            st.caption("Wklej jako telegram.session_string, potem Save.")
             st.code(sess)
-            st.info(
-                "Po zapisaniu w Secrets bot będzie startował bez kodu. "
-                "Nie uruchamiaj tej samej sesji lokalnie i na Cloud naraz."
-            )
 
     if st.button("🔄 Odśwież"):
         st.rerun()
@@ -501,9 +528,9 @@ with tab2:
             positions = asyncio.run_coroutine_threadsafe(
                 broker.get_open_positions(), loop
             ).result(timeout=5)
-            bal = asyncio.run_coroutine_threadsafe(
-                broker.get_balance(), loop
-            ).result(timeout=5)
+            bal = asyncio.run_coroutine_threadsafe(broker.get_balance(), loop).result(
+                timeout=5
+            )
 
             c1, c2, c3 = st.columns(3)
             c1.metric("Cash", f"{bal.get('cash', 0):.2f} {bal.get('currency', '')}")
@@ -562,11 +589,9 @@ with tab4:
 st.divider()
 st.markdown(
     """
-**Uwagi bezpieczeństwa**
-- Klucze API i dane Telethon trzymaj wyłącznie w Streamlit Secrets.
-- Na początku zawsze używaj trybu **Paper (Demo)**.
-- **Binance Live** = prawdziwe środki.
-- Jedna `session_string` = tylko Cloud **albo** lokalnie, nigdy jednocześnie.
-- Po **Ponownym logowaniu** skopiuj nowy `session_string` do Secrets.
+**Uwagi**
+- Masz `session_string` w Secrets → **nie** klikaj «Ponowne logowanie».
+- Jeśli znowu prosi o kod: kliknij **✅ Anuluj – użyj sesji z Secrets**, potem Start.
+- Jedna sesja = tylko Cloud (nie lokalnie jednocześnie).
 """
 )
