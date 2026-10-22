@@ -1,17 +1,19 @@
 """
-File-based bridge for Telegram login + bot running flag.
-Survives Streamlit script reruns (unlike module-level dicts on Cloud).
+File-based bridge for Telegram login, bot running flag, and UI logs.
+Survives Streamlit script reruns on Cloud.
 """
 
 from __future__ import annotations
 
 import json
 import time
+from collections import deque
 from typing import Any, Optional
 
 from config import DATA_DIR
 
 BRIDGE_PATH = DATA_DIR / "auth_bridge.json"
+LOG_PATH = DATA_DIR / "ui_logs.json"
 
 
 def _read() -> dict:
@@ -139,7 +141,6 @@ def is_force_relogin() -> bool:
 
 
 def set_bot_running(running: bool, broker_name: str | None = None) -> None:
-    """Persist bot running flag so UI survives Streamlit reruns."""
     data = _read()
     data["bot_running"] = bool(running)
     data["bot_updated_at"] = time.time()
@@ -161,10 +162,6 @@ def get_broker_name() -> str:
     return str(_read().get("broker_name") or "")
 
 
-def reset() -> None:
-    _write({"status": "idle", "bot_running": False, "updated_at": time.time()})
-
-
 def force_stopped() -> None:
     data = _read()
     data["status"] = "stopped"
@@ -174,3 +171,33 @@ def force_stopped() -> None:
     data.pop("code", None)
     data.pop("password", None)
     _write(data)
+
+
+def append_log(line: str) -> None:
+    """Append one log line for the UI (max 150)."""
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        logs: list = []
+        if LOG_PATH.exists():
+            try:
+                logs = json.loads(LOG_PATH.read_text(encoding="utf-8"))
+            except Exception:
+                logs = []
+        if not isinstance(logs, list):
+            logs = []
+        logs.insert(0, line)
+        logs = logs[:150]
+        LOG_PATH.write_text(json.dumps(logs, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def load_logs(limit: int = 100) -> list[str]:
+    try:
+        if LOG_PATH.exists():
+            logs = json.loads(LOG_PATH.read_text(encoding="utf-8"))
+            if isinstance(logs, list):
+                return [str(x) for x in logs[:limit]]
+    except Exception:
+        pass
+    return []
