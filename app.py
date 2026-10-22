@@ -22,7 +22,6 @@ from bot.risk_manager import RiskManager
 from bot.telegram_listener import TelegramListener
 from bot import auth_bridge
 
-# Robust import – never fail the whole app if package re-export glitches
 try:
     from bot import signal_store
 except ImportError:
@@ -38,10 +37,6 @@ st.set_page_config(
     page_icon="📈",
     layout="wide",
 )
-
-# ---------------------------------------------------------------------------
-# Thread-safe shared state (background threads must NOT touch st.session_state)
-# ---------------------------------------------------------------------------
 
 _lock = threading.Lock()
 _shared_logs: deque = deque(maxlen=200)
@@ -59,16 +54,14 @@ _runtime: dict = {
     "loop": None,
     "thread": None,
 }
-# Shared with Telethon for interactive login via Streamlit UI
 _auth_state: dict = {
-    "status": "idle",  # idle | awaiting_code | awaiting_password | authorized | running | error
+    "status": "idle",
     "error": None,
     "session_string": None,
 }
 
 
 def add_log(msg: str) -> None:
-    """Safe from any thread."""
     ts = datetime.now().strftime("%H:%M:%S")
     line = f"[{ts}] {msg}"
     with _lock:
@@ -77,7 +70,6 @@ def add_log(msg: str) -> None:
 
 
 def on_signal_callback(signal, result) -> None:
-    """Called from Telethon thread – must be thread-safe."""
     our_side = result.get("side") or signal.side
     entry = {
         "time": datetime.now().isoformat(timespec="seconds"),
@@ -96,7 +88,6 @@ def on_signal_callback(signal, result) -> None:
     with _lock:
         _shared_signals.appendleft(entry)
 
-    # Persist – prefer sync from this thread (no event-loop fights)
     try:
         signal_store.save_signal_sync(entry)
     except Exception as e:
@@ -130,16 +121,14 @@ def init_state():
 init_state()
 
 
-# ---------------------------------------------------------------------------
-# Async runner in background thread
-# ---------------------------------------------------------------------------
-
 def start_bot_background(broker_type: str, position_size_pct: float):
     with _lock:
         if _shared_status["bot_running"]:
             return
         _shared_status["stop_requested"] = False
         _shared_status["error"] = None
+
+    force_login = auth_bridge.is_force_relogin()
 
     def run():
         loop = asyncio.new_event_loop()
@@ -161,6 +150,7 @@ def start_bot_background(broker_type: str, position_size_pct: float):
                     executor,
                     on_signal_callback=on_signal_callback,
                     auth_state=_auth_state,
+                    force_fresh_login=force_login,
                 )
 
                 global _runtime
@@ -175,13 +165,14 @@ def start_bot_background(broker_type: str, position_size_pct: float):
                     _shared_status["broker_name"] = broker.name
                     _shared_status["stop_requested"] = False
 
-                has_sess = bool((config.TELEGRAM_SESSION_STRING or "").strip())
+                has_sess = bool((config.TELEGRAM_SESSION_STRING or "").strip()) and not force_login
                 add_log(
                     f"Bot started ({broker.name}) | "
                     f"size={position_size_pct}% capital | "
                     f"invert={config.INVERT_SIGNAL} | "
                     f"SL={config.SL_PCT}% TP={config.TP_PCT}% | "
-                    f"session_string={'YES' if has_sess else 'NO'}"
+                    f"session_string={'YES' if has_sess else 'NO (fresh login)'} | "
+                    f"force_relogin={force_login}"
                 )
 
                 await listener.start()
@@ -191,14 +182,13 @@ def start_bot_background(broker_type: str, position_size_pct: float):
                     _shared_status["bot_running"] = False
                     _shared_status["error"] = str(e)
                 try:
-                    auth_bridge.force_stopped()
-                except Exception:
                     auth_bridge.set_status("error", error=str(e))
+                except Exception:
+                    pass
                 add_log(f"ERROR: {e}")
 
         try:
             loop.run_until_complete(main())
-            # Keep loop alive only while not stopped
             while True:
                 with _lock:
                     if _shared_status.get("stop_requested") or not _shared_status.get("bot_running"):
@@ -214,7 +204,9 @@ def start_bot_background(broker_type: str, position_size_pct: float):
             with _lock:
                 _shared_status["bot_running"] = False
             try:
-                auth_bridge.force_stopped()
+                # keep error status if set; otherwise mark stopped
+                if auth_bridge.get_status() not in ("error", "awaiting_code", "awaiting_password", "sending_code"):
+                    auth_bridge.force_stopped()
             except Exception:
                 pass
             try:
@@ -230,12 +222,10 @@ def start_bot_background(broker_type: str, position_size_pct: float):
 
 
 def stop_bot():
-    """Stop listener/broker and force UI status to stopped."""
     with _lock:
         _shared_status["stop_requested"] = True
         _shared_status["bot_running"] = False
 
-    # Always clear auth bridge so green indicator cannot stick
     try:
         auth_bridge.force_stopped()
     except Exception:
@@ -283,10 +273,6 @@ def stop_bot():
 
 
 def _is_bot_running() -> bool:
-    """
-    Single source of truth for UI.
-    Never force True from stale auth_bridge after an explicit stop.
-    """
     with _lock:
         if _shared_status.get("stop_requested"):
             return False
@@ -295,13 +281,13 @@ def _is_bot_running() -> bool:
     if not running:
         return False
 
-    # Thread still alive?
     t = _runtime.get("thread")
     if t is not None and not t.is_alive():
         with _lock:
             _shared_status["bot_running"] = False
         try:
-            auth_bridge.force_stopped()
+            if auth_bridge.get_status() not in ("error", "awaiting_code", "awaiting_password", "sending_code"):
+                auth_bridge.force_stopped()
         except Exception:
             pass
         return False
@@ -318,13 +304,12 @@ st.caption(
     "Nasłuchuje sygnałów z Twojego bota (Telethon) i wykonuje je na koncie demo / paper."
 )
 
-# Auto-refresh while waiting for Telegram code / 2FA or while bot runs
 _auth_st = auth_bridge.get_status()
 if _auth_st in ("sending_code", "awaiting_code", "awaiting_password") or _is_bot_running():
     try:
         from streamlit_autorefresh import st_autorefresh
 
-        st_autorefresh(interval=3000, key="ui_refresh")
+        st_autorefresh(interval=2500, key="ui_refresh")
     except ImportError:
         if _auth_st in ("sending_code", "awaiting_code", "awaiting_password"):
             st.info("⏳ Czekam na logowanie Telegram… klikaj **🔄 Odśwież** co 2–3 s.")
@@ -338,8 +323,8 @@ with st.sidebar:
         index=0,
         help=(
             "Paper = wirtualne konto. "
-            "Binance = USDT-M Futures (prawdziwy LONG/SHORT). "
-            "Live = prawdziwe środki. Symbole: AAPL→AAPLB (secrets [symbols])."
+            "Binance = USDT-M Futures. "
+            "Live = prawdziwe środki."
         ),
     )
 
@@ -349,7 +334,6 @@ with st.sidebar:
         max_value=50.0,
         value=float(config.POSITION_SIZE_PCT),
         step=1.0,
-        help="Ile procent dostępnego kapitału przeznaczać na jedną transakcję.",
     )
 
     st.info(
@@ -368,27 +352,10 @@ with st.sidebar:
     elif status["telegram_api_id_set"]:
         st.warning("Jest API ID, ale brak API HASH")
     else:
-        st.error("Brak TELEGRAM_API_ID – uzupełnij secrets / .env")
-        with st.expander("Jak ustawić secrets?"):
-            st.code(
-                """[telegram]
-api_id = 31647829
-api_hash = "twój_hash"
-phone = "+48514934698"
-signal_bot_username = "Riczi_trader_bot"
+        st.error("Brak TELEGRAM_API_ID – uzupełnij secrets")
 
-[binance]
-api_key = "..."
-api_secret = "..."
-testnet = true
-
-[risk]
-position_size_pct = 10.0
-sl_pct = 1.0
-tp_pct = 3.0
-invert_signal = true""",
-                language="toml",
-            )
+    if not status.get("telegram_phone_set"):
+        st.warning("Brak phone w secrets – potrzebny do ponownego logowania")
 
     st.divider()
     bot_running = _is_bot_running()
@@ -403,7 +370,6 @@ invert_signal = true""",
             stop_bot()
             st.rerun()
 
-    # Force-reset if UI is stuck
     if st.button("🔄 Reset statusu (jeśli zablokowany)"):
         stop_bot()
         with _lock:
@@ -417,6 +383,30 @@ invert_signal = true""",
         add_log("Status force-reset by user")
         st.rerun()
 
+    # --- Re-login without local machine ---
+    st.divider()
+    st.subheader("Ponowne logowanie")
+    st.caption(
+        "Gdy sesja padła (AuthKeyDuplicated) albo chcesz nową sesję – "
+        "bez generowania lokalnie."
+    )
+    if st.button("🔐 Ponowne logowanie Telegram", disabled=bot_running):
+        stop_bot()
+        auth_bridge.set_force_relogin(True)
+        with _lock:
+            _shared_status["error"] = None
+            _shared_status["bot_running"] = False
+            _shared_status["stop_requested"] = True
+        add_log("Force re-login armed – next Start will request Telegram code")
+        st.success(
+            "Gotowe. Kliknij **▶ Start bota**. "
+            "Kod przyjdzie do aplikacji Telegram – wpisz go poniżej."
+        )
+        st.rerun()
+
+    if auth_bridge.is_force_relogin():
+        st.warning("⚡ Tryb nowego logowania aktywny – Start poprosi o kod SMS/Telegram")
+
     if bot_running:
         bn = _shared_status.get("broker_name") or "?"
         status_label = f"🟢 Działa ({bn}) – nasłuchuje @{config.SIGNAL_BOT_USERNAME}"
@@ -427,7 +417,6 @@ invert_signal = true""",
     if _shared_status.get("error"):
         st.error(_shared_status["error"])
 
-    # --- Interactive Telegram login (code / 2FA) via file bridge ---
     bridge = auth_bridge.get_all()
     auth_status = bridge.get("status", "idle")
     st.caption(f"Auth status: `{auth_status}`")
@@ -437,7 +426,7 @@ invert_signal = true""",
 
     if auth_status in ("awaiting_code", "sending_code", "idle", "error", "stopped"):
         st.warning(
-            "📱 Kod z Telegrama (aplikacja → oficjalna wiadomość „Telegram”). "
+            "📱 Kod z Telegrama (aplikacja → oficjalna wiadomość «Telegram»). "
             "Wpisz poniżej i kliknij Wyślij."
         )
         code = st.text_input("Kod z Telegrama", key="tg_code_input")
@@ -460,9 +449,16 @@ invert_signal = true""",
 
     sess = bridge.get("session_string") or auth_bridge.get_session_string()
     if sess and auth_status in ("authorized", "running"):
-        with st.expander("💾 Zapisz sesję do secrets (żeby nie logować się ponownie)"):
-            st.caption("Wklej do Streamlit Secrets jako telegram.session_string:")
+        with st.expander("💾 WAŻNE: zapisz nową sesję do Secrets", expanded=True):
+            st.caption(
+                "Wklej do Streamlit Secrets jako telegram.session_string "
+                "(zastąp starą wartość), potem Save."
+            )
             st.code(sess)
+            st.info(
+                "Po zapisaniu w Secrets bot będzie startował bez kodu. "
+                "Nie uruchamiaj tej samej sesji lokalnie i na Cloud naraz."
+            )
 
     if st.button("🔄 Odśwież"):
         st.rerun()
@@ -474,8 +470,6 @@ with tab1:
     st.subheader("Ostatnie sygnały")
     with _lock:
         signals = list(_shared_signals)
-
-    # Merge with DB (survives reruns on same machine / container)
     try:
         db_signals = signal_store.load_signals_sync(50)
         seen = {(s.get("order_id"), s.get("time")) for s in signals}
@@ -488,7 +482,6 @@ with tab1:
         logger.warning("UI load signals failed: %s", e)
 
     if signals:
-        # newest first
         try:
             signals = sorted(signals, key=lambda x: x.get("time") or "", reverse=True)
         except Exception:
@@ -570,10 +563,10 @@ st.divider()
 st.markdown(
     """
 **Uwagi bezpieczeństwa**
-- Klucze API i dane Telethon trzymaj wyłącznie w `.streamlit/secrets.toml` lub zmiennych środowiskowych.
+- Klucze API i dane Telethon trzymaj wyłącznie w Streamlit Secrets.
 - Na początku zawsze używaj trybu **Paper (Demo)**.
-- Na Binance akcje są mapowane (AAPL→AAPLB, AMZN→AMZNB…). Własne mapowanie: secrets `[symbols] AAPL = "AAPLB"`.
-- **Binance Live** używa prawdziwych środków – najpierw testuj Paper / Testnet.
-- **Streamlit Cloud:** pierwsze logowanie Telethon (kod SMS) działa tylko lokalnie. Na Cloud wrzuć gotowy `session_string` do secrets.
+- **Binance Live** = prawdziwe środki.
+- Jedna `session_string` = tylko Cloud **albo** lokalnie, nigdy jednocześnie.
+- Po **Ponownym logowaniu** skopiuj nowy `session_string` do Secrets.
 """
 )
