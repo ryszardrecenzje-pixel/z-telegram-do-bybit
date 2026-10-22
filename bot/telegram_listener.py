@@ -12,6 +12,7 @@ from typing import Callable, Optional, Set
 
 from telethon import TelegramClient, events
 from telethon.errors import SessionPasswordNeededError
+from telethon.errors.rpcerrorlist import AuthKeyDuplicatedError
 from telethon.sessions import StringSession
 
 from bot import auth_bridge
@@ -23,6 +24,15 @@ from utils.logger import get_logger
 logger = get_logger("telegram_listener")
 
 POLL_INTERVAL_SEC = 8
+
+AUTH_KEY_MSG = (
+    "Sesja Telegram unieważniona (AuthKeyDuplicatedError). "
+    "Ta sama session_string była użyta z dwóch IP naraz "
+    "(np. lokalnie + Streamlit Cloud). "
+    "Wygeneruj NOWĄ sesję TYLKO lokalnie: python scripts/generate_session.py "
+    "i wklej session_string do Streamlit Secrets. "
+    "Nie uruchamiaj bota lokalnie i na Cloud jednocześnie z tą samą sesją."
+)
 
 
 class TelegramListener:
@@ -41,6 +51,7 @@ class TelegramListener:
         self._phone_code_hash: Optional[str] = None
         self._seen_ids: Set[int] = set()
         self._signal_bot_entity = None
+        self._fatal_auth = False
 
     async def start(self) -> None:
         if self._running:
@@ -70,10 +81,14 @@ class TelegramListener:
             config.TELEGRAM_API_HASH,
         )
 
-        await self.client.connect()
-
-        if not await self.client.is_user_authorized():
-            await self._interactive_login()
+        try:
+            await self.client.connect()
+            if not await self.client.is_user_authorized():
+                await self._interactive_login()
+        except AuthKeyDuplicatedError:
+            self._fatal_auth = True
+            auth_bridge.set_status("error", error=AUTH_KEY_MSG)
+            raise RuntimeError(AUTH_KEY_MSG)
 
         me = await self.client.get_me()
         logger.info("Telethon logged in as %s", me.username or me.phone)
@@ -88,17 +103,19 @@ class TelegramListener:
         signal_bot = config.SIGNAL_BOT_USERNAME.lstrip("@")
         self._signal_bot_entity = await self._resolve_signal_bot(signal_bot)
 
-        # Seed seen IDs with recent messages so we don't re-process history
         try:
             recent = await self.client.get_messages(self._signal_bot_entity, limit=15)
             for msg in recent:
                 if msg and msg.id:
                     self._seen_ids.add(msg.id)
             logger.info("Seeded %d recent message ids (won't re-process)", len(self._seen_ids))
+        except AuthKeyDuplicatedError:
+            self._fatal_auth = True
+            auth_bridge.set_status("error", error=AUTH_KEY_MSG)
+            raise RuntimeError(AUTH_KEY_MSG)
         except Exception:
             logger.exception("Could not seed recent messages")
 
-        # Push handler (may be flaky on Streamlit Cloud)
         @self.client.on(events.NewMessage(from_users=self._signal_bot_entity))
         async def handler(event: events.NewMessage.Event):
             try:
@@ -106,7 +123,6 @@ class TelegramListener:
             except Exception:
                 logger.exception("Error in push handler")
 
-        # Also listen to ALL incoming for debug (first 80 chars)
         @self.client.on(events.NewMessage(incoming=True))
         async def debug_all(event: events.NewMessage.Event):
             try:
@@ -131,10 +147,6 @@ class TelegramListener:
         self._poll_task = asyncio.create_task(self._poll_loop())
 
     async def _resolve_signal_bot(self, signal_bot: str):
-        """
-        Resolve bot by @username, then by dialog title/name.
-        Display name in Telegram can differ from real @username.
-        """
         try:
             entity = await self.client.get_entity(signal_bot)
             logger.info(
@@ -191,18 +203,18 @@ class TelegramListener:
 
         raise RuntimeError(
             f"Nie znaleziono bota pasującego do '{signal_bot}'. "
-            "W logach jest lista czatów – sprawdź prawdziwy @username bota "
-            "(w Telegramie: profil bota → jeśli jest @nazwa, wpisz ją w secrets jako signal_bot_username). "
-            "Otwórz też czat z botem na koncie, którym jesteś zalogowany."
+            "W logach jest lista czatów – sprawdź prawdziwy @username bota."
         )
 
     async def _poll_loop(self) -> None:
-        """Fallback: poll private chat with signal bot for new messages."""
-        while self._running and self.client:
+        while self._running and self.client and not self._fatal_auth:
             try:
                 await asyncio.sleep(POLL_INTERVAL_SEC)
                 if not self._running or not self.client or not self._signal_bot_entity:
                     continue
+                if not self.client.is_connected():
+                    logger.warning("Client disconnected – stopping poll")
+                    break
                 messages = await self.client.get_messages(self._signal_bot_entity, limit=10)
                 for msg in reversed(list(messages)):
                     if not msg or not msg.id:
@@ -215,12 +227,28 @@ class TelegramListener:
                     await self._handle_message(msg)
             except asyncio.CancelledError:
                 break
+            except AuthKeyDuplicatedError:
+                self._fatal_auth = True
+                self._running = False
+                logger.error(AUTH_KEY_MSG)
+                auth_bridge.set_status("error", error=AUTH_KEY_MSG)
+                try:
+                    if self.client:
+                        await self.client.disconnect()
+                except Exception:
+                    pass
+                break
+            except ConnectionError as e:
+                logger.warning("Connection error in poll: %s – stopping", e)
+                break
             except Exception:
+                if self._fatal_auth:
+                    break
                 logger.exception("Poll loop error")
                 await asyncio.sleep(5)
 
     async def _handle_message(self, message) -> None:
-        if message is None:
+        if message is None or self._fatal_auth:
             return
         mid = getattr(message, "id", None)
         if mid is not None:
@@ -333,4 +361,4 @@ class TelegramListener:
 
     @property
     def is_running(self) -> bool:
-        return self._running
+        return self._running and not self._fatal_auth
