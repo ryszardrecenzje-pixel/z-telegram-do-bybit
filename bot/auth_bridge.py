@@ -1,5 +1,5 @@
 """
-File-based bridge for Telegram login code between Streamlit UI and background thread.
+File-based bridge for Telegram login + bot running flag.
 Survives Streamlit script reruns (unlike module-level dicts on Cloud).
 """
 
@@ -84,7 +84,6 @@ def set_session_string(s: str) -> None:
     data["session_string"] = s
     data["status"] = data.get("status") or "authorized"
     data["updated_at"] = time.time()
-    # Successful login always ends force-relogin mode
     data.pop("force_relogin", None)
     _write(data)
 
@@ -101,7 +100,6 @@ def clear_session_string() -> None:
 
 
 def set_force_relogin(value: bool = True) -> None:
-    """Next bot start ignores secrets session_string and does interactive login."""
     data = _read()
     if value:
         data["force_relogin"] = True
@@ -109,6 +107,7 @@ def set_force_relogin(value: bool = True) -> None:
         data.pop("code", None)
         data.pop("password", None)
         data["status"] = "idle"
+        data["bot_running"] = False
     else:
         data.pop("force_relogin", None)
     data["updated_at"] = time.time()
@@ -116,7 +115,6 @@ def set_force_relogin(value: bool = True) -> None:
 
 
 def clear_force_relogin() -> None:
-    """Cancel force-relogin – next Start will use secrets session_string."""
     data = _read()
     data.pop("force_relogin", None)
     data["updated_at"] = time.time()
@@ -140,16 +138,39 @@ def is_force_relogin() -> bool:
     return bool(_read().get("force_relogin"))
 
 
+def set_bot_running(running: bool, broker_name: str | None = None) -> None:
+    """Persist bot running flag so UI survives Streamlit reruns."""
+    data = _read()
+    data["bot_running"] = bool(running)
+    data["bot_updated_at"] = time.time()
+    if broker_name is not None:
+        data["broker_name"] = broker_name
+    if running:
+        data["status"] = "running"
+    elif data.get("status") == "running":
+        data["status"] = "stopped"
+    data["updated_at"] = time.time()
+    _write(data)
+
+
+def is_bot_running_file() -> bool:
+    return bool(_read().get("bot_running"))
+
+
+def get_broker_name() -> str:
+    return str(_read().get("broker_name") or "")
+
+
 def reset() -> None:
-    _write({"status": "idle", "updated_at": time.time()})
+    _write({"status": "idle", "bot_running": False, "updated_at": time.time()})
 
 
 def force_stopped() -> None:
-    """Hard-set stopped so UI never sticks on green after Stop."""
     data = _read()
     data["status"] = "stopped"
+    data["bot_running"] = False
     data["updated_at"] = time.time()
+    data["bot_updated_at"] = time.time()
     data.pop("code", None)
     data.pop("password", None)
-    # Do NOT clear force_relogin here – user may have armed it intentionally
     _write(data)
