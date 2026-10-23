@@ -1,8 +1,6 @@
 """
-Telethon userbot – listens for signals from the configured bot.
-
-On Streamlit Cloud pure push events are unreliable, so we also poll
-the private chat with the signal bot every few seconds.
+Telethon userbot – listens ONLY for signals from the configured signal bot.
+Push events + poll of that private chat every few seconds.
 """
 
 from __future__ import annotations
@@ -27,9 +25,19 @@ POLL_INTERVAL_SEC = 8
 
 AUTH_KEY_MSG = (
     "Sesja Telegram unieważniona (AuthKeyDuplicatedError). "
-    "Kliknij w panelu «Ponowne logowanie Telegram», potem Start bota, "
-    "wpisz kod z aplikacji Telegram i skopiuj nowy session_string do Secrets."
+    "Kliknij «Ponowne logowanie Telegram», Start, wpisz kod, "
+    "skopiuj nowy session_string do Secrets."
 )
+
+
+def _ui_log(msg: str) -> None:
+    try:
+        from datetime import datetime
+
+        line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+        auth_bridge.append_log(line)
+    except Exception:
+        pass
 
 
 class TelegramListener:
@@ -49,7 +57,9 @@ class TelegramListener:
         self._poll_task: Optional[asyncio.Task] = None
         self._phone_code_hash: Optional[str] = None
         self._seen_ids: Set[int] = set()
+        self._processed_signals: Set[int] = set()
         self._signal_bot_entity = None
+        self._signal_bot_id: Optional[int] = None
         self._fatal_auth = False
 
     async def start(self) -> None:
@@ -58,12 +68,8 @@ class TelegramListener:
             return
 
         if not config.TELEGRAM_API_ID or not config.TELEGRAM_API_HASH:
-            raise RuntimeError(
-                "TELEGRAM_API_ID and TELEGRAM_API_HASH must be set "
-                "(get them at https://my.telegram.org/apps)"
-            )
+            raise RuntimeError("TELEGRAM_API_ID and TELEGRAM_API_HASH must be set")
 
-        # force_relogin from UI button, or constructor flag
         force = self.force_fresh_login or auth_bridge.pop_force_relogin()
 
         session_str = ""
@@ -79,8 +85,7 @@ class TelegramListener:
             logger.info("Using StringSession")
             session = StringSession(session_str)
         else:
-            # Empty StringSession → interactive login (works on Streamlit Cloud via UI code input)
-            logger.info("No session – starting interactive login (code via Streamlit UI)")
+            logger.info("No session – interactive login via Streamlit UI")
             session = StringSession()
 
         self.client = TelegramClient(
@@ -105,12 +110,12 @@ class TelegramListener:
         try:
             new_str = StringSession.save(self.client.session)
             auth_bridge.set_session_string(new_str)
-            logger.info("Session string saved to auth_bridge – copy it to secrets")
         except Exception:
             logger.exception("Could not export session string")
 
         signal_bot = config.SIGNAL_BOT_USERNAME.lstrip("@")
         self._signal_bot_entity = await self._resolve_signal_bot(signal_bot)
+        self._signal_bot_id = int(getattr(self._signal_bot_entity, "id", 0) or 0)
 
         try:
             recent = await self.client.get_messages(self._signal_bot_entity, limit=15)
@@ -126,6 +131,7 @@ class TelegramListener:
         except Exception:
             logger.exception("Could not seed recent messages")
 
+        # ONLY messages from the signal bot – no global inbox spam
         @self.client.on(events.NewMessage(from_users=self._signal_bot_entity))
         async def handler(event: events.NewMessage.Event):
             try:
@@ -133,25 +139,14 @@ class TelegramListener:
             except Exception:
                 logger.exception("Error in push handler")
 
-        @self.client.on(events.NewMessage(incoming=True))
-        async def debug_all(event: events.NewMessage.Event):
-            try:
-                text = event.message.message or ""
-                if not text.strip():
-                    return
-                sender = await event.get_sender()
-                uname = getattr(sender, "username", None) or str(getattr(sender, "id", "?"))
-                logger.info("TG incoming from=%s: %s", uname, text[:80].replace("\n", " | "))
-            except Exception:
-                pass
-
         self._running = True
         auth_bridge.set_status("running")
-        logger.info(
-            "Listening for signals from @%s (push + poll every %ss)",
-            signal_bot,
-            POLL_INTERVAL_SEC,
+        msg = (
+            f"Listening ONLY @{signal_bot} (id={self._signal_bot_id}) "
+            f"push + poll every {POLL_INTERVAL_SEC}s"
         )
+        logger.info(msg)
+        _ui_log(msg)
 
         self._task = asyncio.create_task(self.client.run_until_disconnected())
         self._poll_task = asyncio.create_task(self._poll_loop())
@@ -160,7 +155,7 @@ class TelegramListener:
         try:
             entity = await self.client.get_entity(signal_bot)
             logger.info(
-                "Resolved by username @%s → id=%s username=%s",
+                "Resolved @%s → id=%s username=%s",
                 signal_bot,
                 getattr(entity, "id", "?"),
                 getattr(entity, "username", "?"),
@@ -171,18 +166,12 @@ class TelegramListener:
 
         target = signal_bot.lower().replace(" ", "")
         matches = []
-        bot_dialogs_log = []
         async for dialog in self.client.iter_dialogs():
             entity = dialog.entity
             is_bot = bool(getattr(entity, "bot", False))
             uname = (getattr(entity, "username", None) or "") or ""
             title = (dialog.name or "") or ""
             first = (getattr(entity, "first_name", None) or "") or ""
-            if is_bot or dialog.is_user:
-                bot_dialogs_log.append(
-                    f"id={getattr(entity, 'id', '?')} bot={is_bot} "
-                    f"@{uname or '-'} title={title!r}"
-                )
             if not (is_bot or dialog.is_user):
                 continue
             candidates = [
@@ -192,16 +181,6 @@ class TelegramListener:
             ]
             if target in candidates or any(target in c for c in candidates if c):
                 matches.append(entity)
-                logger.info(
-                    "Dialog match: id=%s @%s title=%r",
-                    getattr(entity, "id", "?"),
-                    uname,
-                    title,
-                )
-
-        logger.info("Bot/user dialogs found (%d):", len(bot_dialogs_log))
-        for line in bot_dialogs_log[:40]:
-            logger.info("  %s", line)
 
         if len(matches) == 1:
             return matches[0]
@@ -212,8 +191,7 @@ class TelegramListener:
             return matches[0]
 
         raise RuntimeError(
-            f"Nie znaleziono bota pasującego do '{signal_bot}'. "
-            "W logach jest lista czatów – sprawdź prawdziwy @username bota."
+            f"Nie znaleziono bota '{signal_bot}'. Sprawdź signal_bot_username w secrets."
         )
 
     async def _poll_loop(self) -> None:
@@ -224,6 +202,7 @@ class TelegramListener:
                     continue
                 if not self.client.is_connected():
                     logger.warning("Client disconnected – stopping poll")
+                    _ui_log("Telegram disconnected – poll stopped")
                     break
                 messages = await self.client.get_messages(self._signal_bot_entity, limit=10)
                 for msg in reversed(list(messages)):
@@ -250,8 +229,8 @@ class TelegramListener:
                     pass
                 break
             except ConnectionError as e:
-                logger.warning("Connection error in poll: %s – stopping", e)
-                break
+                logger.warning("Connection error in poll: %s", e)
+                await asyncio.sleep(10)
             except Exception:
                 if self._fatal_auth:
                     break
@@ -261,32 +240,40 @@ class TelegramListener:
     async def _handle_message(self, message) -> None:
         if message is None or self._fatal_auth:
             return
+
         mid = getattr(message, "id", None)
-        if mid is not None:
-            if mid in self._seen_ids and mid in getattr(self, "_processed_signals", set()):
-                return
-            self._seen_ids.add(mid)
+        if mid is not None and mid in self._processed_signals:
+            return
 
         text = message.message or ""
         if not text.strip():
             return
 
-        logger.info("Processing msg id=%s: %s", mid, text[:120].replace("\n", " | "))
+        preview = text[:100].replace("\n", " | ")
+        logger.info("Signal-bot msg id=%s: %s", mid, preview)
+        _ui_log(f"Od @{config.SIGNAL_BOT_USERNAME}: {preview}")
 
         signal = parse_signal(text)
         if signal is None:
-            logger.info("Not a SIGNAL format – ignored")
+            logger.info("Not SIGNAL format – ignored")
+            _ui_log("→ pominięte (brak formatu SIGNAL)")
+            if mid is not None:
+                self._seen_ids.add(mid)
             return
 
-        if not hasattr(self, "_processed_signals"):
-            self._processed_signals = set()
         if mid is not None:
-            if mid in self._processed_signals:
-                return
             self._processed_signals.add(mid)
+            self._seen_ids.add(mid)
+
+        _ui_log(f"SIGNAL {signal.action} {signal.symbol} {signal.side} @ {signal.price}")
 
         result = await self.executor.handle_signal(signal)
         logger.info("Execution result: %s", result)
+        ok = result.get("success")
+        _ui_log(
+            f"→ {result.get('side') or signal.side} | "
+            f"{'OK' if ok else 'FAIL'}: {result.get('message')}"
+        )
 
         if self.on_signal_callback:
             try:
@@ -298,8 +285,7 @@ class TelegramListener:
         phone = config.TELEGRAM_PHONE
         if not phone:
             raise RuntimeError(
-                "TELEGRAM_PHONE jest wymagany do logowania. "
-                "Dodaj w Streamlit Secrets: [telegram] phone = \"+48...\""
+                "TELEGRAM_PHONE wymagany – dodaj w Secrets: [telegram] phone = \"+48...\""
             )
 
         logger.info("Sending login code to %s ...", phone)
@@ -309,15 +295,14 @@ class TelegramListener:
             sent = await self.client.send_code_request(phone)
             self._phone_code_hash = sent.phone_code_hash
             auth_bridge.set_status("awaiting_code", phone_code_hash=sent.phone_code_hash)
-            logger.info("Code requested OK. Sprawdź aplikację Telegram.")
+            logger.info("Code requested OK")
         except Exception as e:
             auth_bridge.set_status("error", error=f"Nie udało się wysłać kodu: {e}")
-            logger.exception("send_code_request failed")
             raise
 
         code = await self._wait_pop(auth_bridge.pop_code, timeout=600)
         if not code:
-            auth_bridge.set_status("error", error="Timeout – nie wpisano kodu w panelu")
+            auth_bridge.set_status("error", error="Timeout – brak kodu w panelu")
             raise RuntimeError("Login timeout: no code entered in UI")
 
         try:
@@ -327,7 +312,6 @@ class TelegramListener:
                 phone_code_hash=self._phone_code_hash,
             )
         except SessionPasswordNeededError:
-            logger.info("2FA password required")
             auth_bridge.set_status("awaiting_password")
             password = await self._wait_pop(auth_bridge.pop_password, timeout=600)
             if not password:
