@@ -49,15 +49,34 @@ class BinanceBroker(BaseBroker):
                 "defaultType": "swap",  # USDT-M perpetual
             },
         }
-        if not self.live:
-            opts["sandbox"] = True
 
         # binanceusdm = USDT-M futures
         self.exchange = ccxt.binanceusdm(opts)
+
+        # Demo Trading (demo.binance.com) – NIE używać starego sandbox/testnet
+        # https://github.com/ccxt/ccxt/issues/27039
+        if not self.live:
+            if hasattr(self.exchange, "enable_demo_trading"):
+                self.exchange.enable_demo_trading(True)
+                logger.info("Binance Demo Trading enabled (demo-fapi.binance.com)")
+            else:
+                # Fallback: ręczne URL-e demo futures
+                try:
+                    api = self.exchange.urls.get("api") or {}
+                    for k, v in list(api.items()):
+                        if isinstance(v, str) and "fapi.binance.com" in v:
+                            api[k] = v.replace(
+                                "fapi.binance.com", "demo-fapi.binance.com"
+                            )
+                    self.exchange.urls["api"] = api
+                    logger.info("Binance Demo URLs patched manually")
+                except Exception as e:
+                    logger.warning("Could not enable demo trading: %s", e)
+
         await self.exchange.load_markets()
         logger.info(
             "Binance USDT-M Futures connected mode=%s markets=%d",
-            "LIVE" if self.live else "TESTNET",
+            "LIVE" if self.live else "DEMO",
             len(self.exchange.markets or {}),
         )
 
@@ -72,7 +91,6 @@ class BinanceBroker(BaseBroker):
         candidates: list[str] = []
 
         mapped = map_symbol(signal_symbol, "binance")
-        # Common ccxt forms for Binance USDT-M
         for base in (mapped, signal_symbol.upper(), mapped.rstrip("B")):
             base = base.upper()
             if not base:
@@ -85,7 +103,6 @@ class BinanceBroker(BaseBroker):
                 ]
             )
 
-        # De-dupe preserving order
         seen = set()
         ordered = []
         for c in candidates:
@@ -100,7 +117,6 @@ class BinanceBroker(BaseBroker):
                 )
                 return cand
 
-        # Fuzzy: any market whose base matches mapped ticker
         base_u = mapped.upper()
         for m, info in (self.exchange.markets or {}).items():
             b = (info.get("base") or "").upper()
@@ -117,7 +133,6 @@ class BinanceBroker(BaseBroker):
     async def get_balance(self) -> dict:
         assert self.exchange
         bal = await self.exchange.fetch_balance()
-        # USDT-M wallet
         usdt = bal.get("USDT") or bal.get("total") or {}
         if isinstance(usdt, dict):
             cash = float(usdt.get("free") or 0)
@@ -148,7 +163,6 @@ class BinanceBroker(BaseBroker):
             if contracts == 0:
                 continue
             side_raw = (p.get("side") or "").lower()
-            # ccxt: side long/short, or sign of contracts
             if side_raw in ("short", "sell"):
                 side: Side = "SHORT"
             else:
@@ -176,11 +190,6 @@ class BinanceBroker(BaseBroker):
         tp: Optional[float] = None,
         **kwargs,
     ) -> OrderResult:
-        """
-        Classic directional position on USDT-M:
-          LONG  → buy / open long
-          SHORT → sell / open short  (profit if price drops)
-        """
         assert self.exchange
         try:
             market_symbol = self._resolve_market(symbol)
@@ -206,17 +215,15 @@ class BinanceBroker(BaseBroker):
                 message="Quantity after precision is 0",
             )
 
-        # Hedge mode vs one-way: set position side for hedge accounts
         params: dict = {}
         try:
-            # Binance hedge mode uses positionSide
             params["positionSide"] = "LONG" if side == "LONG" else "SHORT"
         except Exception:
             pass
 
         logger.info(
             "Binance futures %s OPEN %s %s qty=%s (signal=%s) SL=%s TP=%s",
-            "LIVE" if self.live else "TESTNET",
+            "LIVE" if self.live else "DEMO",
             side,
             market_symbol,
             quantity,
@@ -239,7 +246,6 @@ class BinanceBroker(BaseBroker):
                 or 0
             )
 
-            # Optional reduce-only SL/TP as stop orders (best-effort)
             await self._place_sl_tp(
                 market_symbol, side, quantity, sl, tp
             )
@@ -254,7 +260,6 @@ class BinanceBroker(BaseBroker):
                 message=f"Futures OPEN {side} {market_symbol}",
             )
         except Exception as e:
-            # Retry without positionSide (one-way mode)
             if "positionSide" in str(e) or "position side" in str(e).lower():
                 try:
                     order = await self.exchange.create_order(
@@ -291,10 +296,8 @@ class BinanceBroker(BaseBroker):
         sl: Optional[float],
         tp: Optional[float],
     ) -> None:
-        """Best-effort stop-loss / take-profit as reduce-only stops."""
         if not self.exchange:
             return
-        # Closing side is opposite
         close_side = "sell" if side == "LONG" else "buy"
         params_base = {"reduceOnly": True}
         try:
@@ -302,7 +305,7 @@ class BinanceBroker(BaseBroker):
         except Exception:
             pass
 
-        for label, stop_price, order_type in (
+        for label, stop_price, otype in (
             ("SL", sl, "STOP_MARKET"),
             ("TP", tp, "TAKE_PROFIT_MARKET"),
         ):
@@ -315,14 +318,13 @@ class BinanceBroker(BaseBroker):
                 )
                 await self.exchange.create_order(
                     market_symbol,
-                    order_type.lower().replace("_", "_"),  # stop_market
+                    otype,
                     close_side,
                     quantity,
                     params=params,
                 )
                 logger.info("Placed %s %s @ %s", label, market_symbol, stop_price)
             except Exception as e:
-                # Many testnet quirks – log and continue
                 logger.warning("Could not place %s: %s", label, e)
 
     async def close_position(
@@ -333,20 +335,17 @@ class BinanceBroker(BaseBroker):
         price: Optional[float] = None,
         **kwargs,
     ) -> OrderResult:
-        """Close an open futures position (reduce-only market)."""
         assert self.exchange
         try:
             market_symbol = self._resolve_market(symbol)
         except Exception as e:
             return OrderResult(success=False, symbol=symbol, message=str(e))
 
-        # Find position size if not provided
         qty = quantity
         pos_side: Optional[Side] = side
         if qty is None or pos_side is None:
             positions = await self.get_open_positions()
             for p in positions:
-                # match by base ticker in symbol
                 if market_symbol.split("/")[0] in p.symbol.replace(":", "/"):
                     qty = p.quantity
                     pos_side = p.side
@@ -364,7 +363,6 @@ class BinanceBroker(BaseBroker):
             )
 
         pos_side = pos_side or "LONG"
-        # Close long → sell; close short → buy
         order_side = "sell" if pos_side == "LONG" else "buy"
 
         try:
@@ -400,7 +398,6 @@ class BinanceBroker(BaseBroker):
                 message=f"Futures CLOSE {pos_side} {market_symbol}",
             )
         except Exception as e:
-            # one-way mode retry
             try:
                 order = await self.exchange.create_order(
                     market_symbol,
