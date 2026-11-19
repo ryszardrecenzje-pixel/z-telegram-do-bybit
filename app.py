@@ -129,6 +129,7 @@ def start_bot_background(broker_type: str, position_size_pct: float):
 
                 await broker.connect()
                 risk = RiskManager(position_size_pct=position_size_pct)
+                risk.reset_daily()
                 executor = Executor(broker, risk)
                 listener = TelegramListener(
                     executor,
@@ -278,8 +279,7 @@ def _is_bot_running() -> bool:
     alive = t is not None and t.is_alive()
     if alive and (mem or file_running):
         return True
-    if file_running:
-        return True
+    # A stale flag from a crashed run must not block Start.
     return False
 
 
@@ -411,10 +411,6 @@ with st.sidebar:
     if auth_status == "error" and bridge.get("error"):
         st.error(str(bridge["error"]))
 
-    sess = bridge.get("session_string") or auth_bridge.get_session_string()
-    if sess and auth_status in ("authorized", "running"):
-        with st.expander("💾 session_string"):
-            st.code(sess)
 
     if st.button("🔄 Odśwież"):
         st.rerun()

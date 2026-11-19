@@ -236,7 +236,8 @@ class PaperBroker(BaseBroker):
         for r in rows:
             if remaining is not None and remaining <= 0:
                 break
-            qty = float(r["quantity"]) if remaining is None else min(remaining, float(r["quantity"]))
+            avail = float(r["quantity"])
+            qty = avail if remaining is None else min(remaining, avail)
             if remaining is not None:
                 remaining -= qty
             entry = float(r["entry_price"])
@@ -250,21 +251,21 @@ class PaperBroker(BaseBroker):
             total_pnl += pnl
             closed_qty += qty
 
-            if qty >= float(r["quantity"]) - 1e-9:
+            new_qty = round(avail - qty, 8)
+            if new_qty <= 0:
                 await self._db.execute(
                     "UPDATE paper_positions SET status = 'closed' WHERE id = ?",
                     (r["id"],),
                 )
             else:
                 await self._db.execute(
-                    "UPDATE paper_positions SET quantity = quantity - ? WHERE id = ?",
-                    (qty, r["id"]),
+                    "UPDATE paper_positions SET quantity = ? WHERE id = ?",
+                    (new_qty, r["id"]),
                 )
 
-            # Return proceeds at the closing price (works for LONG and SHORT).
-            # For SHORT the open outlay was price*qty, so returning price*qty + pnl
-            # removes the inflated balance caused by using entry*qty.
-            self._cash += price * qty + pnl
+            # Return capital at the closing price (correct for LONG and SHORT).
+            # Old entry*qty+pnl inflated SHORT balance.
+            self._cash += price * qty
 
         await self._db.execute(
             "UPDATE paper_balance SET cash = ?, updated_at = ? WHERE id = 1",

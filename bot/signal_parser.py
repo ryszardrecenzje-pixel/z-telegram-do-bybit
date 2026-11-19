@@ -26,7 +26,7 @@ from utils.logger import get_logger
 
 logger = get_logger("signal_parser")
 
-SignalAction = Literal["BUY", "SELL", "CLOSE", "UNKNOWN"]
+SignalAction = Literal["BUY", "CLOSE", "UNKNOWN"]
 
 
 @dataclass
@@ -72,10 +72,8 @@ def parse_signal(text: str) -> Optional[Signal]:
 
     # Detect action
     action: SignalAction = "UNKNOWN"
-    if re.search(r"SIGNAL\s+BUY", upper):
+    if re.search(r"SIGNAL\s+(BUY|SELL)", upper):
         action = "BUY"
-    elif re.search(r"SIGNAL\s+SELL", upper):
-        action = "SELL"
     elif re.search(r"SIGNAL\s+CLOSE", upper):
         action = "CLOSE"
     else:

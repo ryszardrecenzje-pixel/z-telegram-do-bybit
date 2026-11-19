@@ -36,14 +36,15 @@ class RiskManager:
         self._starting_equity: Optional[float] = None
         self._pnl_day: Optional[date] = None
 
+    def reset_daily(self) -> None:
+        self._daily_pnl = 0.0
+        self._starting_equity = None
+
     async def update_equity(self, broker: BaseBroker) -> None:
         today = date.today()
         if self._pnl_day != today:
-            # New trading day: reset daily PnL and the equity baseline.
             self._pnl_day = today
-            self._daily_pnl = 0.0
-            self._starting_equity = None
-            logger.info("Daily PnL and equity baseline reset for %s", today)
+            self.reset_daily()
         bal = await broker.get_balance()
         equity = float(bal.get("equity", 0))
         if self._starting_equity is None:

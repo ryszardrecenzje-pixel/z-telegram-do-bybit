@@ -80,7 +80,7 @@ class Executor:
         try:
             if signal.action == "BUY":
                 return await self._handle_buy(signal, our_side, result)
-            elif signal.action in ("SELL", "CLOSE"):
+            elif signal.action == "CLOSE":
                 return await self._handle_close(signal, our_side, result)
             else:
                 result["message"] = f"Unknown action: {signal.action}"
@@ -165,7 +165,7 @@ class Executor:
         result["quantity"] = order.quantity
         result["price"] = order.price
 
-        # Use the structured PnL from the order result, not text parsed from a message.
+        # Use structured PnL from the order result, not text parsed from a message.
         if order.success and getattr(order, "pnl", None) is not None:
             self.risk.record_pnl(float(order.pnl))
 
