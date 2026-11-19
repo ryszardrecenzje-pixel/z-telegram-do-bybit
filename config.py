@@ -193,7 +193,7 @@ class _Config:
 
     @property
     def INVERT_SIGNAL(self) -> bool:
-        v = self._get("INVERT_SIGNAL", "risk", "invert_signal", "true")
+        v = self._get("INVERT_SIGNAL", "risk", "invert_signal", "false")
         return str(v).lower() in ("1", "true", "yes")
 
     @property

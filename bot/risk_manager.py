@@ -6,6 +6,7 @@ Position size = POSITION_SIZE_PCT % of available capital (default 10%).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from typing import Optional
 
 from bot.brokers.base import BaseBroker
@@ -29,12 +30,20 @@ class RiskManager:
         max_daily_loss_pct: float | None = None,
         **kwargs,  # accept legacy args from UI without breaking
     ):
-        self.position_size_pct = position_size_pct or config.POSITION_SIZE_PCT
-        self.max_daily_loss_pct = max_daily_loss_pct or config.MAX_DAILY_LOSS_PCT
+        self.position_size_pct = position_size_pct if position_size_pct is not None else config.POSITION_SIZE_PCT
+        self.max_daily_loss_pct = max_daily_loss_pct if max_daily_loss_pct is not None else config.MAX_DAILY_LOSS_PCT
         self._daily_pnl: float = 0.0
         self._starting_equity: Optional[float] = None
+        self._pnl_day: Optional[date] = None
 
     async def update_equity(self, broker: BaseBroker) -> None:
+        today = date.today()
+        if self._pnl_day != today:
+            # New trading day: reset daily PnL and the equity baseline.
+            self._pnl_day = today
+            self._daily_pnl = 0.0
+            self._starting_equity = None
+            logger.info("Daily PnL and equity baseline reset for %s", today)
         bal = await broker.get_balance()
         equity = float(bal.get("equity", 0))
         if self._starting_equity is None:

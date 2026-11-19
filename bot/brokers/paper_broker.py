@@ -232,8 +232,13 @@ class PaperBroker(BaseBroker):
         order_id = str(uuid.uuid4())[:12]
         now = datetime.utcnow().isoformat()
 
+        remaining = quantity
         for r in rows:
-            qty = float(r["quantity"]) if quantity is None else min(quantity, float(r["quantity"]))
+            if remaining is not None and remaining <= 0:
+                break
+            qty = float(r["quantity"]) if remaining is None else min(remaining, float(r["quantity"]))
+            if remaining is not None:
+                remaining -= qty
             entry = float(r["entry_price"])
             pos_side = r["side"]
 
@@ -245,13 +250,21 @@ class PaperBroker(BaseBroker):
             total_pnl += pnl
             closed_qty += qty
 
-            await self._db.execute(
-                "UPDATE paper_positions SET status = 'closed' WHERE id = ?",
-                (r["id"],),
-            )
+            if qty >= float(r["quantity"]) - 1e-9:
+                await self._db.execute(
+                    "UPDATE paper_positions SET status = 'closed' WHERE id = ?",
+                    (r["id"],),
+                )
+            else:
+                await self._db.execute(
+                    "UPDATE paper_positions SET quantity = quantity - ? WHERE id = ?",
+                    (qty, r["id"]),
+                )
 
-            # Return capital + pnl
-            self._cash += entry * qty + pnl
+            # Return proceeds at the closing price (works for LONG and SHORT).
+            # For SHORT the open outlay was price*qty, so returning price*qty + pnl
+            # removes the inflated balance caused by using entry*qty.
+            self._cash += price * qty + pnl
 
         await self._db.execute(
             "UPDATE paper_balance SET cash = ?, updated_at = ? WHERE id = 1",
@@ -286,6 +299,7 @@ class PaperBroker(BaseBroker):
             quantity=closed_qty,
             price=price,
             message=f"Closed. PnL: {total_pnl:.2f}",
+            pnl=total_pnl,
         )
 
     async def get_trade_history(self, limit: int = 50) -> list[dict]:

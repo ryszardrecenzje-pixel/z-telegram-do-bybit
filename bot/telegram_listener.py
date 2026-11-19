@@ -263,6 +263,8 @@ class TelegramListener:
 
         if mid is not None:
             self._processed_signals.add(mid)
+            if len(self._processed_signals) > 1000:
+                self._processed_signals = set(sorted(self._processed_signals)[-500:])
             self._seen_ids.add(mid)
 
         _ui_log(f"SIGNAL {signal.action} {signal.symbol} {signal.side} @ {signal.price}")

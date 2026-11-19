@@ -34,6 +34,7 @@ class OrderResult:
     quantity: float = 0.0
     price: float = 0.0
     message: str = ""
+    pnl: Optional[float] = None
     timestamp: datetime = field(default_factory=datetime.utcnow)
 
 
